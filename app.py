@@ -12,7 +12,7 @@ if sys.platform == "win32":
         asyncio.set_event_loop(loop)
 
 
-
+import uvicorn
 import os
 import logging
 import uuid
@@ -507,31 +507,37 @@ async def get_conversation_history(business_id: str, user_id: str, thread_id: Op
 
 
 # Add this to the BOTTOM of your app.py file (replace existing if __name__ == "__main__")
+import logging
+logging.basicConfig(level=logging.INFO)
 
 if __name__ == "__main__":
-    import sys
-    import asyncio
-    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    logging.info(f"Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+# if __name__ == "__main__":
+#     import sys
+#     import asyncio
+#     import uvicorn
     
-    # Set event loop policy BEFORE creating the loop
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+#     # Set event loop policy BEFORE creating the loop
+#     if sys.platform == 'win32':
+#         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
-    # Create and set the event loop with the correct policy
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+#     # Create and set the event loop with the correct policy
+#     loop = asyncio.new_event_loop()
+#     asyncio.set_event_loop(loop)
     
-    print("✅ Event loop policy set and loop created with WindowsSelectorEventLoopPolicy")
+#     print("✅ Event loop policy set and loop created with WindowsSelectorEventLoopPolicy")
     
-    # Run uvicorn programmatically with our loop
-    config = uvicorn.Config(
-        "app:app",
-        host="0.0.0.0",
-        port=8000,
-        loop="asyncio",  # Use asyncio loop type
-        reload=False
-    )
-    server = uvicorn.Server(config)
+#     # Run uvicorn programmatically with our loop
+#     config = uvicorn.Config(
+#         "app:app",
+#         host="0.0.0.0",
+#         port=8000,
+#         loop="asyncio",  # Use asyncio loop type
+#         reload=False
+#     )
+#     server = uvicorn.Server(config)
     
-    # Run with our event loop
-    loop.run_until_complete(server.serve())
+#     # Run with our event loop
+#    loop.run_until_complete(server.serve())
