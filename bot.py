@@ -31,7 +31,6 @@ from langgraph.graph import MessagesState
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 from langgraph.checkpoint.memory import MemorySaver
-from IPython.display import Image, display
 from langgraph.store.base import BaseStore
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, merge_message_runs
 from langchain_core.runnables import RunnableConfig
