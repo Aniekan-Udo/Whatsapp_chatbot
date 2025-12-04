@@ -261,7 +261,7 @@ async def upload_document(
     Uploads a document/PDF from the user's device and triggers a RAG refresh 
     for the specified business in the background.
     """
-    
+    await ensure_db_initialized()
     filename = document_file.filename
     
     if not filename or not allowed_file(filename):
@@ -448,6 +448,7 @@ async def delete_user_profile(business_id: str, user_id: str):
     Delete a user's profile and conversation history.
     """
     try:
+        await ensure_db_initialized()
         pool = await get_pool()
         
         async with pool.connection() as conn:
