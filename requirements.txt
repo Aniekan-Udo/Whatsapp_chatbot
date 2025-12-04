@@ -22,3 +22,7 @@ watchdog
 httpx
 pandas
 chromadb
+requests
+aiohttp
+sqlalchemy
+openai
