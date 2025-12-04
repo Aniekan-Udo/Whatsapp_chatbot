@@ -170,30 +170,32 @@ async def ensure_db_initialized():
             detail=f"Database initialization failed: {str(e)}"
         )
 
-# Helper functions
-async def ensure_rag_initialized(business_id: str, doc_path: Optional[str] = None):
-    """Ensure RAG is initialized for a business before processing messages."""
-    global rag_initialized, file_observers
+async def ensure_db_initialized():
+    """Initialize database on first request (lazy initialization)."""
+    global graph, db_initialized
     
-    if business_id not in rag_initialized:
-        logger.info(f"Initializing RAG for business {business_id}...")
-        try:
-            await initialize_rag(business_id=business_id, doc_path=doc_path)
-            rag_initialized[business_id] = True
-            
-            # Start file monitoring for this business
-            if business_id not in file_observers:
-                observer = start_file_monitoring(business_id)
-                if observer:
-                    file_observers[business_id] = observer
-            
-            logger.info(f"✅ RAG initialized for business {business_id}")
-        except Exception as e:
-            logger.error(f"Failed to initialize RAG for business {business_id}: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to initialize knowledge base: {str(e)}"
-            )
+    logger.info(f"ensure_db_initialized called. Current status: {db_initialized}")
+    
+    if db_initialized:
+        logger.info("DB already initialized, returning immediately")
+        return
+    
+    logger.info("🔧 Initializing database on first request...")
+    
+    try:
+        logger.info("Calling initialize_graph()...")
+        graph = await initialize_graph()
+        logger.info("initialize_graph() completed")
+        
+        db_initialized = True
+        logger.info("✅ Database initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Database initialization failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database initialization failed: {str(e)}"
+        )
 
 
 def allowed_file(filename: str) -> bool:
@@ -253,51 +255,66 @@ async def health_check():
 
 @app.post("/upload", tags=["Knowledge Base"])
 async def upload_document(
-    business_id: str = Form(..., description="Unique identifier for the business to assign the document to"),
-    document_file: UploadFile = File(..., description="Document or PDF file to upload and refresh RAG with"),
+    business_id: str = Form(...),
+    document_file: UploadFile = File(...),
     background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
-    """
-    Uploads a document/PDF from the user's device and triggers a RAG refresh 
-    for the specified business in the background.
-    """
-    await ensure_db_initialized()
-    filename = document_file.filename
+    """Upload document and trigger RAG refresh."""
     
-    if not filename or not allowed_file(filename):
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid file type or no file selected. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
-        )
-
-    # Create a business-specific directory
-    business_upload_dir = UPLOAD_ROOT_PATH / business_id
-    if not business_upload_dir.exists():
-        business_upload_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save the file with a unique name
-    file_extension = Path(filename).suffix
-    unique_filename = f"{uuid.uuid4().hex}{file_extension}"
-    file_path = business_upload_dir / unique_filename
-
     try:
-        content = await document_file.read()
-        await asyncio.to_thread(file_path.write_bytes, content)
-        logger.info(f"File saved to {file_path}")
+        logger.info(f"=== UPLOAD REQUEST STARTED ===")
+        logger.info(f"Business ID: {business_id}")
+        logger.info(f"Filename: {document_file.filename}")
         
+        logger.info("Step 1: Ensuring DB initialized...")
+        await ensure_db_initialized()
+        logger.info("Step 1: ✅ DB initialized")
+        
+        logger.info("Step 2: Validating filename...")
+        filename = document_file.filename
+        
+        if not filename or not allowed_file(filename):
+            logger.error(f"Invalid file type: {filename}")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            )
+        logger.info(f"Step 2: ✅ Filename valid: {filename}")
+
+        logger.info("Step 3: Creating upload directory...")
+        business_upload_dir = UPLOAD_ROOT_PATH / business_id
+        business_upload_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Step 3: ✅ Directory created: {business_upload_dir}")
+        
+        logger.info("Step 4: Saving file...")
+        file_extension = Path(filename).suffix
+        unique_filename = f"{uuid.uuid4().hex}{file_extension}"
+        file_path = business_upload_dir / unique_filename
+        
+        content = await document_file.read()
+        logger.info(f"Step 4a: File read, size: {len(content)} bytes")
+        
+        await asyncio.to_thread(file_path.write_bytes, content)
+        logger.info(f"Step 4: ✅ File saved to {file_path}")
+        
+        logger.info("Step 5: Adding background task...")
+        background_tasks.add_task(process_and_refresh_rag_task, business_id, file_path)
+        logger.info("Step 5: ✅ Background task added")
+        
+        logger.info("=== UPLOAD REQUEST COMPLETED ===")
+        
+        return JSONResponse(content={
+            "status": "processing",
+            "message": f"Document '{filename}' uploaded successfully.",
+            "file_id": unique_filename,
+            "business_id": business_id
+        }, status_code=202)
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error saving file: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"There was an error saving the file: {e}")
-    
-    # Add the RAG refresh task to the background
-    background_tasks.add_task(process_and_refresh_rag_task, business_id, file_path)
-    
-    return JSONResponse(content={
-        "status": "processing",
-        "message": f"Document '{filename}' uploaded successfully. RAG refresh initiated in the background for business {business_id}.",
-        "file_id": unique_filename,
-        "business_id": business_id
-    }, status_code=202)
+        logger.error(f"❌ UPLOAD FAILED: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
