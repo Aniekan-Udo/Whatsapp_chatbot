@@ -49,78 +49,33 @@ file_observers = {}
 async def lifespan(app: FastAPI):
     """Initialize resources on startup and cleanup on shutdown."""
     global graph
-    logger.info("=" * 60)
-    logger.info("Starting FastAPI application...")
-    logger.info("=" * 60)
+    
+    logger.info("🚀 Starting application...")
     
     try:
-        # Initialize database and graph
-        logger.info("Step 1: Initializing database and graph...")
+        # Just initialize graph - fast and simple
         graph = await initialize_graph()
-        logger.info("✅ Graph initialized successfully")
+        logger.info("✅ Application ready")
         
-        # Note: setup_database() is already called inside initialize_graph()
-        # so we don't need to call it again here
-        
-        # Verify database connection
-        logger.info("Step 2: Verifying database connection...")
-        pool = await get_pool()
-        async with pool.connection() as conn:
-            result = await conn.execute("SELECT COUNT(*) FROM user_profiles")
-            count = (await result.fetchone())[0]
-            logger.info(f"✅ Database connected - Found {count} user profiles")
-            
-            # Check other tables
-            for table in ['store', 'checkpoints', 'writes', 'business_documents']:
-                result = await conn.execute(f"SELECT COUNT(*) FROM {table}")
-                table_count = (await result.fetchone())[0]
-                logger.info(f"  - {table}: {table_count} records")
-        
-        # Ensure the upload path exists
-        if not UPLOAD_ROOT_PATH.exists():
-            UPLOAD_ROOT_PATH.mkdir(parents=True, exist_ok=True)
-            logger.info(f"✅ Created upload directory: {UPLOAD_ROOT_PATH}")
-        else:
-            logger.info(f"✅ Upload directory exists: {UPLOAD_ROOT_PATH}")
-        
-        logger.info("=" * 60)
-        logger.info("✅ APPLICATION READY TO RECEIVE REQUESTS")
-        logger.info("=" * 60)
-        logger.info(f"API Docs: http://localhost:8000/docs")
-        logger.info(f"Health Check: http://localhost:8000/health")
-        logger.info("=" * 60)
+        # Ensure upload dir exists
+        UPLOAD_ROOT_PATH.mkdir(parents=True, exist_ok=True)
         
     except Exception as e:
-        logger.error("=" * 60)
-        logger.error(f"❌ STARTUP FAILED: {e}")
-        logger.error("=" * 60)
-        import traceback
-        traceback.print_exc()
+        logger.error(f"❌ Startup failed: {e}")
         raise
     
-    yield  # Application runs here
+    yield
     
     # Cleanup
-    logger.info("=" * 60)
-    logger.info("Shutting down application...")
-    logger.info("=" * 60)
-    
-    # Stop file observers
-    for business_id, observer in file_observers.items():
-        logger.info(f"Stopping file observer for business {business_id}...")
+    logger.info("Shutting down...")
+    for observer in file_observers.values():
         observer.stop()
         observer.join()
     
-    # Close database pool
     pool = await get_pool()
     if pool and not pool.closed:
         await pool.close()
-        logger.info("✅ Database pool closed")
-    
-    logger.info("=" * 60)
-    logger.info("✅ Application shutdown complete")
-    logger.info("=" * 60)
-
+        
 # Initialize FastAPI app
 app = FastAPI(
     title="WhatsApp Assistant API",

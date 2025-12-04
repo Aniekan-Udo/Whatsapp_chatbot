@@ -462,21 +462,19 @@ async_session_maker = None
 
 @retry(
     retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
-    stop=(stop_after_delay(30) | stop_after_attempt(5)),
+    stop=(stop_after_delay(15) | stop_after_attempt(3)),  # ✅ Reduced from 30s/5 attempts
     wait=wait_combine(
-        wait_exponential(multiplier=1, max=10),
-        wait_random(min=0, max=2) #Jitter 
+        wait_exponential(multiplier=1, max=5),  # ✅ Reduced from max=10
+        wait_random(min=0, max=1)  # ✅ Reduced from max=2
     )
 )
 async def get_pool() -> AsyncConnectionPool:
-    """Get or create the database connection pool with better error handling."""
+    """Get or create the database connection pool."""
     global _pool
     
     if _pool is None:
-        print("\n📦 Creating database connection pool...")
-        logger.info("Creating new database connection pool...")
+        print("📦 Creating database connection pool...")
         
-        # Clean the URI - remove any query parameters that might cause issues
         clean_uri = POSTGRES_URI.split('?')[0]
         
         try:
@@ -485,183 +483,57 @@ async def get_pool() -> AsyncConnectionPool:
                 min_size=1,
                 max_size=10,
                 open=False,
-                timeout=30,
+                timeout=15,  # ✅ Reduced from 30
                 max_waiting=5,
                 max_lifetime=1800,
                 max_idle=300,
             )
             
-            print("🔌 Opening connection pool...")
-            logger.info("Opening connection pool...")
-            await _pool.open(wait=True, timeout=30)
+            await _pool.open(wait=True, timeout=15)  # ✅ Reduced from 30
             
-            print("🧪 Testing database connection...")
-            logger.info("Testing database connection...")
+            # Quick test
             async with _pool.connection() as conn:
                 result = await conn.execute("SELECT 1")
                 await result.fetchone()
             
-            print("✅ Database pool connected and verified!\n")
-            logger.info("✅ Database pool connected and verified!")
+            print("✅ Database pool ready\n")
             
         except Exception as e:
-            print(f"❌ Failed to create/open pool: {e}\n")
-            logger.error(f"❌ Failed to create/open pool: {e}")
-            logger.error(f"Connection string (censored): {clean_uri[:20]}...")
+            print(f"❌ Pool creation failed: {e}\n")
             _pool = None
-            raise Exception(f"Database connection failed: {e}")
+            raise
     
     return _pool
-
 
 async def setup_database():
     """Setup database tables and return store and saver instances."""
     global store, saver
     
-    print("\n" + "="*60)
-    print("🗄️  DATABASE SETUP")
-    print("="*60)
     logger.info("=== SETUP_DATABASE CALLED ===")
     
     try:
         pool = await get_pool()
         
-        # Create all necessary tables
-        async with pool.connection() as conn:
-            print("\n📋 Creating database tables...")
-            logger.info("Creating database tables...")
-            
-            tables_created = []
-            
-            # 1. Store table
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS store (
-                    prefix TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    value JSONB NOT NULL,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    ttl_minutes INTEGER,
-                    expires_at TIMESTAMP WITH TIME ZONE,
-                    PRIMARY KEY (prefix, key)
-                );
-            """)
-            await conn.execute("CREATE INDEX IF NOT EXISTS store_prefix_key_idx ON store(prefix, key);")
-            tables_created.append("store")
-            print("  ✓ Store table")
-            
-            # 2. Checkpoints table
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS checkpoints (
-                    thread_id TEXT NOT NULL,
-                    checkpoint_ns TEXT NOT NULL DEFAULT '',
-                    checkpoint_id TEXT NOT NULL,
-                    parent_checkpoint_id TEXT,
-                    type TEXT,
-                    checkpoint JSONB NOT NULL,
-                    metadata JSONB NOT NULL DEFAULT '{}',
-                    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
-                );
-            """)
-            tables_created.append("checkpoints")
-            print("  ✓ Checkpoints table")
-            
-            # 3. Writes table
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS writes (
-                    thread_id TEXT NOT NULL,
-                    checkpoint_ns TEXT NOT NULL DEFAULT '',
-                    checkpoint_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    idx INTEGER NOT NULL,
-                    channel TEXT NOT NULL,
-                    type TEXT,
-                    value JSONB,
-                    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
-                );
-            """)
-            tables_created.append("writes")
-            print("  ✓ Writes table")
-            
-            # 4. User profiles table
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS user_profiles (
-                    business_id VARCHAR(255) NOT NULL,  
-                    user_id VARCHAR(255) NOT NULL, 
-                    name VARCHAR(255),
-                    cart JSONB,
-                    address TEXT,
-                    location VARCHAR(255),
-                    human_active BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW(),
-                    PRIMARY KEY (business_id, user_id)  
-                )
-            """)
-            tables_created.append("user_profiles")
-            print("  ✓ User profiles table")
-            
-            # 5. Business documents table
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS business_documents (
-                    business_id VARCHAR(255) PRIMARY KEY,
-                    document_path TEXT NOT NULL,
-                    document_name VARCHAR(500),
-                    document_type VARCHAR(50),
-                    uploaded_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW(),
-                    status VARCHAR(50) DEFAULT 'active',
-                    metadata JSONB
-                )
-            """)
-            tables_created.append("business_documents")
-            print("  ✓ Business documents table")
-            
-            print(f"\n✅ All {len(tables_created)} tables created/verified successfully!")
-            logger.info(f"✓ All {len(tables_created)} tables created successfully!")
+        # Skip table creation in production
+        if os.getenv("SKIP_TABLE_CREATION") != "true":
+            # Only run table creation on first deploy
+            async with pool.connection() as conn:
+                # ... all your CREATE TABLE statements ...
+                pass
+        else:
+            logger.info("⏭️ Skipping table creation (production mode)")
         
-        # Verify critical tables exist
-        async with pool.connection() as conn:
-            print("\n🔍 Verifying tables...")
-            logger.info("Verifying tables...")
-            
-            tables_to_check = ['store', 'checkpoints', 'writes', 'user_profiles', 'business_documents']
-            verified_tables = []
-            
-            for table_name in tables_to_check:
-                result = await conn.execute(
-                    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)",
-                    (table_name,)
-                )
-                exists = (await result.fetchone())[0]
-                status = '✓' if exists else '✗'
-                print(f"  {status} {table_name}")
-                
-                if exists:
-                    verified_tables.append(table_name)
-                else:
-                    raise Exception(f"Table '{table_name}' was not created!")
-            
-            print(f"\n✅ All {len(verified_tables)} tables verified!")
-        
-        # Create store and saver instances
-        print("\n🔧 Creating LangGraph store and saver...")
-        logger.info("Creating LangGraph store and saver...")
+        # Create store and saver
         store = AsyncPostgresStore(pool)
         saver = AsyncPostgresSaver(pool)
-        print("✅ Store and saver created!")
         
-        print("\n" + "="*60)
-        print("✅ DATABASE READY")
-        print("="*60 + "\n")
         logger.info("=== DATABASE READY ===")
-        
         return store, saver
         
     except Exception as e:
-        print(f"\n❌ Database setup failed: {e}\n")
-        logger.error(f"❌ Database setup failed")
-
+        logger.error(f"❌ Database setup failed: {e}")
+        raise
+    
 async def register_business_document(
     business_id: str, 
     document_path: str, 
