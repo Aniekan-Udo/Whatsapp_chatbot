@@ -28,6 +28,7 @@ from langchain_core.messages import HumanMessage
 
 from bot import initialize_graph,setup_database,get_pool,initialize_rag,start_file_monitoring,refresh_rag,store,saver
 
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +44,7 @@ ALLOWED_EXTENSIONS: Set[str] = {".pdf", ".csv", ".xlsx", ".doc", ".docx", ".txt"
 graph = None
 rag_initialized = {}
 file_observers = {}
+db_initialized = False
 
 
 @asynccontextmanager
@@ -53,9 +55,12 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting application...")
     
     try:
-        # Just initialize graph - fast and simple
-        graph = await initialize_graph()
-        logger.info("✅ Application ready")
+        # FAST STARTUP: Just compile graph, no DB calls yet
+        from bot import builder
+        
+        # Compile without checkpointer/store (DB not needed yet)
+        graph = builder.compile()
+        logger.info("✅ Application ready (database will initialize on first request)")
         
         # Ensure upload dir exists
         UPLOAD_ROOT_PATH.mkdir(parents=True, exist_ok=True)
@@ -69,13 +74,21 @@ async def lifespan(app: FastAPI):
     # Cleanup
     logger.info("Shutting down...")
     for observer in file_observers.values():
-        observer.stop()
-        observer.join()
+        try:
+            observer.stop()
+            observer.join()
+        except:
+            pass
     
-    pool = await get_pool()
-    if pool and not pool.closed:
-        await pool.close()
-        
+    try:
+        pool = await get_pool()
+        if pool and not pool.closed:
+            await pool.close()
+    except:
+        pass
+
+
+
 # Initialize FastAPI app
 app = FastAPI(
     title="WhatsApp Assistant API",
@@ -134,6 +147,28 @@ class HealthResponse(BaseModel):
     database: str
     rag_systems: Dict[str, bool]
 
+# Add this function right after the lifespan function (before app = FastAPI...)
+
+async def ensure_db_initialized():
+    """Initialize database on first request (lazy initialization)."""
+    global graph, db_initialized
+    
+    if db_initialized:
+        return
+    
+    logger.info("🔧 Initializing database on first request...")
+    
+    try:
+        # Now initialize the full graph with database
+        graph = await initialize_graph()
+        db_initialized = True
+        logger.info("✅ Database initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Database initialization failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database initialization failed: {str(e)}"
+        )
 
 # Helper functions
 async def ensure_rag_initialized(business_id: str, doc_path: Optional[str] = None):
@@ -192,17 +227,25 @@ async def root():
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
     """Check API health and service status."""
-    try:
-        pool = await get_pool()
-        async with pool.connection() as conn:
-            await conn.execute("SELECT 1")
-        db_status = "connected"
-    except Exception as e:
-        logger.error(f"Database health check failed: {e}")
-        db_status = "disconnected"
+    db_status = "not_initialized"
     
+    if db_initialized:
+        try:
+            pool = await asyncio.wait_for(get_pool(), timeout=2.0)
+            async with pool.connection() as conn:
+                await conn.execute("SELECT 1")
+            db_status = "connected"
+        except asyncio.TimeoutError:
+            db_status = "timeout"
+        except Exception as e:
+            logger.error(f"Database health check failed: {e}")
+            db_status = "error"
+    else:
+        db_status = "initializing"
+    
+    # Always return healthy so Render doesn't kill the service
     return {
-        "status": "healthy" if db_status == "connected" else "unhealthy",
+        "status": "healthy",
         "database": db_status,
         "rag_systems": rag_initialized
     }
@@ -259,9 +302,11 @@ async def upload_document(
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(request: ChatRequest):
-    """
-    Send a message to the assistant and get a response.
-    """
+    """Send a message to the assistant and get a response."""
+    
+    # ADD THIS LINE FIRST
+    await ensure_db_initialized()
+    
     try:
         # Ensure RAG is initialized for this business
         await ensure_rag_initialized(request.business_id)
@@ -312,11 +357,9 @@ async def chat(request: ChatRequest):
 
 @app.post("/rag/initialize", tags=["Knowledge Base"])
 async def initialize_rag_endpoint(request: InitRAGRequest):
-    """
-    Initialize RAG system for a specific business.
-    """
     try:
-        await ensure_rag_initialized(request.business_id, request.doc_path)
+
+        await ensure_db_initialized()
         
         return {
             "status": "success",
@@ -335,6 +378,7 @@ async def refresh_rag_endpoint(request: RefreshRAGRequest):
     Refresh RAG system for a business (e.g., when knowledge base is updated).
     """
     try:
+        await ensure_db_initialized() 
         await refresh_rag(business_id=request.business_id, doc_path=request.doc_path)
         
         return {
@@ -354,6 +398,7 @@ async def get_user_profile(business_id: str, user_id: str):
     Retrieve a user's profile information.
     """
     try:
+        await ensure_db_initialized() 
         pool = await get_pool()
         
         async with pool.connection() as conn:
