@@ -1,5 +1,6 @@
 import sys
 import asyncio
+import asyncpg
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -314,84 +315,49 @@ async def get_init_lock(business_id):
         return _init_locks[business_id]
     
 
-async def retry_with_backoff(
-        max_retries: int = 5,
-        initial_delay: float = 1.0,
-        exponential_base: float = 2.0,
-        jitter: str = "full",
-        exceptions: Tuple = (Exception,)
-):
-    """
-    Async retry decorator with exponential backoff and jitter.
+from tenacity import (
+    retry, retry_if_exception_type, 
+    stop_after_delay, stop_after_attempt,
+    wait_combine, wait_exponential, wait_random
+)
+import requests
+import aiohttp, urllib3,openai,langchain_core
+WHATSAPP_CHATBOT_EXCEPTIONS = (
+    # === NETWORK / HTTP ERRORS ===
+    ConnectionError,
+    requests.exceptions.RequestException,  # WhatsApp API calls
+    aiohttp.ClientError,                   # Async HTTP (if using aiohttp)
+    urllib3.exceptions.NewConnectionError,
+    httpx.ConnectError, httpx.TimeoutException,  # If using httpx
     
-    Automatically retries failed async functions with increasing delays to handle
-    transient failures (network issues, rate limits, temporary service unavailability).
+    # === DATABASE ERRORS ===
+    asyncpg.PostgresError,               # All Postgres errors
+    asyncpg.InterfaceError,
+    asyncpg.InternalServerError,
     
-    Args:
-        max_retries: Maximum number of retry attempts (default: 5)
-        initial_delay: Starting delay in seconds between retries (default: 1.0)
-        exponential_base: Multiplier for delay after each retry (default: 2.0)
-        jitter: Randomization strategy to prevent thundering herd (default: "full")
-        exceptions: Tuple of exception types to catch and retry (default: all exceptions)
     
-    Jitter modes:
-        - "none": No randomization, pure exponential backoff
-        - "full": Random delay between 0 and calculated delay
-        - "equal": Half fixed delay + half random (balanced approach)
-        - "decorrelated": Random between initial_delay and delay * 3 (AWS recommended)
-    
-    Returns:
-        Decorated async function with retry logic
-    
-    Raises:
-        Original exception after max_retries exhausted
-    
-    Example:
-        @retry_with_backoff(max_retries=3, exceptions=(APIError, RateLimitError))
-        async def call_external_api():
-            return await client.fetch_data()
-    
-    Note:
-        Logs warnings on each retry and error on final failure.
-        Uses asyncio.sleep() to avoid blocking the event loop.
-    """
-    def add_jitter(delay: float) -> float:
-        if jitter == "none":
-            return delay
-        if jitter == "full":
-            return random.uniform(0, delay)
-        if jitter == "equal":
-            return delay / 2 + random.uniform(0, delay / 2)
-        if jitter == "decorrelated":
-            return random.uniform(initial_delay, delay * 3)
-        return delay
+    # === VECTOR STORE / RAG ERRORS ===
+    TimeoutError,                        # Embedding timeouts
+    ValueError,                          # Invalid embeddings/vectors
+    IndexError,                        # Vector index issues
+    json.JSONDecodeError,
 
-    def decorator(func: Callable) -> Callable:
 
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            delay = initial_delay
-            last_exception = None
-
-            for attempts in range(1, max_retries + 2):
-                try:
-                    return await func(*args, **kwargs)
-                except exceptions as e:
-                    last_exception = e
-
-                    if attempts > max_retries:
-                        logger.error(f"Failed after {max_retries} attempts: {e}")
-                        raise
-                    sleep_time = add_jitter(delay)
-                    logger.warning(f"Attempts {attempts} failed: {e}. "
-                                   f"Retrying in {sleep_time:.2f}s")
-                    
-                    await asyncio.sleep(sleep_time)
-                    delay *= exponential_base
-
-            raise last_exception
-        return wrapper
-    return decorator                
+    # ==== API ERROR ===
+    APIError,
+    RateLimitError,
+    
+    
+    # === EMBEDDING MODEL ERRORS ===
+    openai.APIError, openai.RateLimitError, openai.APIConnectionError,  
+    
+    # === SYSTEM / FILE ERRORS ===
+    OSError,
+    FileNotFoundError,
+    PermissionError,
+    
+    
+)
 
 
 store = None
@@ -490,11 +456,18 @@ async def create_tables_manually():
 
 
 
-
+import asyncpg
 # Global session maker
 async_session_maker = None
-# Replace your get_pool() and setup_database() functions with these fixed versions:
 
+@retry(
+    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
+    stop=(stop_after_delay(30) | stop_after_attempt(5)),
+    wait=wait_combine(
+        wait_exponential(multiplier=1, max=10),
+        wait_random(min=0, max=2) #Jitter 
+    )
+)
 async def get_pool() -> AsyncConnectionPool:
     """Get or create the database connection pool with better error handling."""
     global _pool
@@ -815,7 +788,14 @@ async def deactivate_business_document(business_id: str):
     
     print(f"Document deactivated for business {business_id}")
 
-
+@retry(
+    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
+    stop=(stop_after_delay(30) | stop_after_attempt(5)),
+    wait=wait_combine(
+        wait_exponential(multiplier=1, max=10),
+        wait_random(min=0, max=2)
+    )
+)
 async def chatbot(state: MessagesState, config: RunnableConfig):
     """Load memory from the store and use it to personalize the chatbot's response."""
     global store
@@ -845,9 +825,14 @@ async def chatbot(state: MessagesState, config: RunnableConfig):
     
     return {"messages": [response]}
 
-
-
-
+@retry(
+    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
+    stop=(stop_after_delay(30) | stop_after_attempt(5)),
+    wait=wait_combine(
+        wait_exponential(multiplier=1, max=10),
+        wait_random(min=0, max=2)
+    )
+)
 async def write_memory(state: MessagesState, config: RunnableConfig):
     """Extract and save profile information."""
     global store
@@ -938,7 +923,14 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
         }]
     }
 
-
+@retry(
+    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
+    stop=(stop_after_delay(30) | stop_after_attempt(5)),
+    wait=wait_combine(
+        wait_exponential(multiplier=1, max=10),
+        wait_random(min=0, max=2)
+    )
+)
 async def check_address_and_finalize(state: MessagesState, config: RunnableConfig):
     """Check if user has address, ask if not, or prepare for escalation."""
     global store
@@ -977,7 +969,14 @@ async def check_address_and_finalize(state: MessagesState, config: RunnableConfi
             }]
         }
     
-    
+@retry(
+    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
+    stop=(stop_after_delay(30) | stop_after_attempt(5)),
+    wait=wait_combine(
+        wait_exponential(multiplier=1, max=10),
+        wait_random(min=0, max=2)
+    )
+)
 async def add_to_cart(state: MessagesState, config: RunnableConfig):
     """Add items to the user's cart with quantity support."""
     global store
@@ -1146,7 +1145,14 @@ async def add_to_cart(state: MessagesState, config: RunnableConfig):
             }]
         }
 
-
+@retry(
+    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
+    stop=(stop_after_delay(30) | stop_after_attempt(5)),
+    wait=wait_combine(
+        wait_exponential(multiplier=1, max=10),
+        wait_random(min=0, max=2)
+    )
+)
 async def remove_cart_item(state: MessagesState, config: RunnableConfig):
     """Remove items from the user's cart with quantity support."""
     global store
@@ -1345,12 +1351,15 @@ async def get_file_hash(path):
     await loop.run_in_executor(None, _read_file)
     return hasher.hexdigest()
 
-@retry_with_backoff(
-    max_retries=3,
-    initial_delay=1.0,
-    jitter="full",
-    exceptions=(APIError, RateLimitError, Timeout)
+@retry(
+    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
+    stop=(stop_after_delay(30) | stop_after_attempt(5)),
+    wait=wait_combine(
+        wait_exponential(multiplier=1, max=10),
+        wait_random(min=0, max=2)
+    )
 )
+
 async def initialize_rag(business_id=None, doc_path=None):
     """Initialize RAG system with Supabase pgvector. Call once at startup per business."""
     global _vector_store_cache, _retriever_cache, _file_hash_cache, _embeddings_cache, _documents_loaded
@@ -1578,11 +1587,13 @@ def start_file_monitoring(business_id):
     return observer
 
 
-@retry_with_backoff(
-    max_retries=3,
-    initial_delay=1.0,
-    jitter="full",
-    exceptions=(ConnectionError, OSError)
+@retry(
+    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
+    stop=(stop_after_delay(40) | stop_after_attempt(5)),
+    wait=wait_combine(
+        wait_exponential(multiplier=1, max=10),
+        wait_random(min=0, max=2)
+    )
 )
 async def rag_search(state: MessagesState, config: RunnableConfig):
     """Perform RAG search on knowledge base."""
@@ -1603,7 +1614,7 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
         }
     
     try:
-        # Initialize (has its own retry for APIError, RateLimitError, Timeout)
+        
         init_lock = get_init_lock(business_id)
         async with init_lock:
             if business_id not in _retriever_cache:
