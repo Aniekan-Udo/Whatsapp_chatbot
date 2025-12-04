@@ -46,6 +46,21 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from trustcall import create_extractor
 from langchain_groq import ChatGroq
 
+from typing import List, Union, Optional
+from psycopg_pool import AsyncConnectionPool
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.store.postgres.aio import AsyncPostgresStore
+
+import os
+import logging
+import random
+from typing import List, Union, Optional
+from pydantic import BaseModel, Field
+from typing import Any, Callable, Tuple
+from functools import wraps
+from openai import OpenAI, APIError, RateLimitError, Timeout
+from threading import Lock
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -174,11 +189,7 @@ profile_extractor = create_extractor(
     tool_choice="Profile",
 )
 
-from typing import List, Union, Optional
 
-
-from typing import List, Union, Optional
-from pydantic import BaseModel, Field
 
 class CartItem(BaseModel):
     """Cart item with quantity support"""
@@ -268,15 +279,8 @@ logger = logging.getLogger(__name__)
 
 MAX_MEMORY_MESSAGES = 100
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
-from psycopg_pool import AsyncConnectionPool
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.store.postgres.aio import AsyncPostgresStore
-from dotenv import load_dotenv
-import os
-import logging
 
-load_dotenv()
-logger = logging.getLogger(__name__)
+
 
 # Use DIRECT connection for LangGraph (checkpointer/store)
 POSTGRES_URI = os.getenv("POSTGRES_URI")
@@ -288,8 +292,108 @@ if not POSTGRES_URI:
 if not POSTGRES_URI_POOLER:
     raise ValueError("POSTGRES_URI_POOLER not set")
 
+_init_locks: Dict[str, asyncio.Lock]={}
+_locks_lock=Lock()
 
-# After all imports and before any functions
+async def get_init_lock(business_id):
+    """Get or create a lock for a particular business ID.
+    
+    Prevents thundering herd scenario during RAG initialization.
+    """
+    async with _locks_lock:
+        if business_id not in _init_locks:
+            _init_locks[business_id] = asyncio.Lock()
+
+            # Simple cleanup: remove oldest locks if cache grows too large
+            if len(_init_locks) > 1000:
+                # Remove first 100 locks
+                to_remove = list(_init_locks.keys())[:100]
+                for key in to_remove:
+                    del _init_locks[key]
+
+        return _init_locks[business_id]
+    
+
+async def retry_with_backoff(
+        max_retries: int = 5,
+        initial_delay: float = 1.0,
+        exponential_base: float = 2.0,
+        jitter: str = "full",
+        exceptions: Tuple = (Exception,)
+):
+    """
+    Async retry decorator with exponential backoff and jitter.
+    
+    Automatically retries failed async functions with increasing delays to handle
+    transient failures (network issues, rate limits, temporary service unavailability).
+    
+    Args:
+        max_retries: Maximum number of retry attempts (default: 5)
+        initial_delay: Starting delay in seconds between retries (default: 1.0)
+        exponential_base: Multiplier for delay after each retry (default: 2.0)
+        jitter: Randomization strategy to prevent thundering herd (default: "full")
+        exceptions: Tuple of exception types to catch and retry (default: all exceptions)
+    
+    Jitter modes:
+        - "none": No randomization, pure exponential backoff
+        - "full": Random delay between 0 and calculated delay
+        - "equal": Half fixed delay + half random (balanced approach)
+        - "decorrelated": Random between initial_delay and delay * 3 (AWS recommended)
+    
+    Returns:
+        Decorated async function with retry logic
+    
+    Raises:
+        Original exception after max_retries exhausted
+    
+    Example:
+        @retry_with_backoff(max_retries=3, exceptions=(APIError, RateLimitError))
+        async def call_external_api():
+            return await client.fetch_data()
+    
+    Note:
+        Logs warnings on each retry and error on final failure.
+        Uses asyncio.sleep() to avoid blocking the event loop.
+    """
+    def add_jitter(delay: float) -> float:
+        if jitter == "none":
+            return delay
+        if jitter == "full":
+            return random.uniform(0, delay)
+        if jitter == "equal":
+            return delay / 2 + random.uniform(0, delay / 2)
+        if jitter == "decorrelated":
+            return random.uniform(initial_delay, delay * 3)
+        return delay
+
+    def decorator(func: Callable) -> Callable:
+
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+
+            for attempts in range(1, max_retries + 2):
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as e:
+                    last_exception = e
+
+                    if attempts > max_retries:
+                        logger.error(f"Failed after {max_retries} attempts: {e}")
+                        raise
+                    sleep_time = add_jitter(delay)
+                    logger.warning(f"Attempts {attempts} failed: {e}. "
+                                   f"Retrying in {sleep_time:.2f}s")
+                    
+                    await asyncio.sleep(sleep_time)
+                    delay *= exponential_base
+
+            raise last_exception
+        return wrapper
+    return decorator                
+
+
 store = None
 saver = None
 
@@ -1241,12 +1345,17 @@ async def get_file_hash(path):
     await loop.run_in_executor(None, _read_file)
     return hasher.hexdigest()
 
-
+@retry_with_backoff(
+    max_retries=3,
+    initial_delay=1.0,
+    jitter="full",
+    exceptions=(APIError, RateLimitError, Timeout)
+)
 async def initialize_rag(business_id=None, doc_path=None):
     """Initialize RAG system with Supabase pgvector. Call once at startup per business."""
     global _vector_store_cache, _retriever_cache, _file_hash_cache, _embeddings_cache, _documents_loaded
     
-    # CRITICAL: Validate business_id
+    # Validate business_id
     if not business_id:
         raise ValueError("business_id is required for RAG initialization")
     
@@ -1351,10 +1460,18 @@ async def initialize_rag(business_id=None, doc_path=None):
             else:
                 raise ValueError(f"Unsupported file format: {doc_path}")
             
-            docs = await loop.run_in_executor(None, loader.load)
-            doc_chunks = await loop.run_in_executor(None, splitter.split_documents, docs)
-            all_documents.extend(doc_chunks)
-            print(f"Loaded {len(doc_chunks)} chunks from {doc_path}")
+            loop = asyncio.get_event_loop()
+
+            if hasattr(loader, 'aload'):
+                docs = await loader.aload()
+                doc_chunks = await loop.run_in_executor(None, splitter.split_documents, docs)
+                all_documents.extend(doc_chunks)
+                print(f"Loaded {len(doc_chunks)} chunks from {doc_path}")
+            else:
+                docs = await loop.run_in_executor(None, loader.load)
+                doc_chunks = await loop.run_in_executor(None, splitter.split_documents, docs)
+                all_documents.extend(doc_chunks)
+                print(f"Loaded {len(doc_chunks)} chunks from {doc_path}")
         else:
             raise ValueError(f"Document path does not exist: {doc_path}")
 
@@ -1368,14 +1485,21 @@ async def initialize_rag(business_id=None, doc_path=None):
         print("This may take a few minutes for large datasets...")
         
         # Add documents to PGVector in batches for better performance
-        batch_size = 100
-        for i in range(0, len(all_documents), batch_size):
-            batch = all_documents[i:i+batch_size]
-            await loop.run_in_executor(
-                None,
-                lambda b=batch: vector_store.add_documents(b)
-            )
-            print(f"  Progress: {min(i+batch_size, len(all_documents))}/{len(all_documents)} documents added")
+        if hasattr(vector_store, 'aadd_documents'):
+            batch_size = 100
+            for i in range(0, len(all_documents), batch_size):
+                batch = all_documents[i:i+batch_size]
+                await vector_store.add_documents(batch)
+                print(f"  Progress: {min(i+batch_size, len(all_documents))}/{len(all_documents)} documents added")
+        
+        else:
+            # Fallback if no .aadd_document method
+            loop = asyncio.get_event_loop()
+            batch_size= 100
+            for i in range(0, len(all_documents), batch_size):
+                batch= all_documents[i:i+batch_size]
+                await loop.run_in_executor(None, lambda b=batch: vector_store.add_documents(b))
+                print(f"  Progress: {min(i+batch_size, len(all_documents))}/{len(all_documents)} documents added")
         
         _documents_loaded[business_id] = True
         _vector_store_cache[business_id] = vector_store
@@ -1454,28 +1578,19 @@ def start_file_monitoring(business_id):
     return observer
 
 
+@retry_with_backoff(
+    max_retries=3,
+    initial_delay=1.0,
+    jitter="full",
+    exceptions=(ConnectionError, OSError)
+)
 async def rag_search(state: MessagesState, config: RunnableConfig):
     """Perform RAG search on knowledge base."""
-    global _retriever_cache, _embeddings_cache
     business_id = config["configurable"]["business_id"]
-
-    # Initialize RAG for this specific business
-    retriever = await initialize_rag(business_id=business_id)
-    
-    # Check if RAG is initialized
-    if not retriever:
-        return {
-            "messages": [{
-                "role": "tool",
-                "content": "Knowledge base not initialized. Please contact support.",
-                "tool_call_id": state["messages"][-1].tool_calls[0]['id']
-            }]
-        }
     
     last_message = state["messages"][-1]
     tool_call = last_message.tool_calls[0]
     args = tool_call.get('args', {})
-    
     search_query = args.get('search_query', '')
     
     if not search_query:
@@ -1488,14 +1603,33 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
         }
     
     try:
-        # 1. Retrieve relevant documents from vector store using ainvoke if available
-        loop = asyncio.get_event_loop()
+        # Initialize (has its own retry for APIError, RateLimitError, Timeout)
+        init_lock = get_init_lock(business_id)
+        async with init_lock:
+            if business_id not in _retriever_cache:
+                await initialize_rag(business_id=business_id)
         
-        # Use the retriever's invoke method in executor to avoid blocking
-        relevant_docs = await loop.run_in_executor(
-            None, 
-            lambda: retriever.invoke(search_query)
-        )
+        retriever = _retriever_cache.get(business_id)
+        
+        if not retriever:
+            return {
+                "messages": [{
+                    "role": "tool",
+                    "content": "Knowledge base not initialized. Please contact support.",
+                    "tool_call_id": tool_call['id']
+                }]
+            }
+        
+        # This part might benefit from retry (connection issues during search)
+        loop = asyncio.get_event_loop()
+        if hasattr(retriever, 'ainvoke'):
+            relevant_docs=await retriever.ainvoke(search_query)
+        else:
+            # Fallback logic
+            relevant_docs = await loop.run_in_executor(
+                None, 
+                lambda: retriever.invoke(search_query)
+            )
         
         if not relevant_docs:
             return {
@@ -1506,10 +1640,8 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
                 }]
             }
         
-        # 2. Format context from retrieved docs
         context = "\n\n".join([doc.page_content for doc in relevant_docs])
         
-        # 3. Return the context (or you can generate a response using LLM)
         return {
             "messages": [{
                 "role": "tool",
@@ -1518,8 +1650,19 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
             }]
         }
     
+    except (APIError, RateLimitError, Timeout) as e:
+        
+        logger.error(f"RAG initialization failed after retries for business {business_id}: {e}")
+        return {
+            "messages": [{
+                "role": "tool",
+                "content": "Sorry, knowledge base initialization failed. Please try again later.",
+                "tool_call_id": tool_call['id']
+            }]
+        }
     except Exception as e:
-        logger.error(f"RAG search failed for business {business_id}: {e}")
+        # Other errors get logged and returned (or let retry wrapper handle if it's ConnectionError/OSError)
+        logger.error(f"RAG search failed for business {business_id}: {e}", exc_info=True)
         return {
             "messages": [{
                 "role": "tool",
@@ -1591,7 +1734,6 @@ builder.add_edge("check_address_and_finalize", "chatbot")
 builder.add_edge("add_to_cart", "chatbot")
 builder.add_edge("remove_cart_item", "chatbot")
 
-# Replace your initialize_graph() function with this:
 
 async def initialize_graph():
     """Initialize the graph with database connection."""
