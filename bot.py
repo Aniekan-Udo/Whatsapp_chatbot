@@ -533,7 +533,7 @@ async def setup_database():
     except Exception as e:
         logger.error(f"❌ Database setup failed: {e}")
         raise
-    
+
 async def register_business_document(
     business_id: str, 
     document_path: str, 
@@ -1467,6 +1467,7 @@ def start_file_monitoring(business_id):
         wait_random(min=0, max=2)
     )
 )
+
 async def rag_search(state: MessagesState, config: RunnableConfig):
     """Perform RAG search on knowledge base."""
     business_id = config["configurable"]["business_id"]
@@ -1487,7 +1488,7 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
     
     try:
         
-        init_lock = get_init_lock(business_id)
+        init_lock = await get_init_lock(business_id)
         async with init_lock:
             if business_id not in _retriever_cache:
                 await initialize_rag(business_id=business_id)
