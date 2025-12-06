@@ -60,7 +60,14 @@ from pydantic import BaseModel, Field
 from typing import Any, Callable, Tuple
 from functools import wraps
 from openai import OpenAI, APIError, RateLimitError, Timeout
-from threading import Lock
+# Move these imports BEFORE get_pool() function
+from tenacity import (
+    retry, retry_if_exception_type, 
+    stop_after_delay, stop_after_attempt,
+    wait_combine, wait_exponential, wait_random
+)
+import requests
+import aiohttp, urllib3,openai,langchain_core
 
 from dotenv import load_dotenv
 
@@ -282,46 +289,6 @@ MAX_MEMORY_MESSAGES = 100
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
 
 
-
-# Use DIRECT connection for LangGraph (checkpointer/store)
-POSTGRES_URI = os.getenv("POSTGRES_URI")
-# Use POOLER connection for PGVector
-POSTGRES_URI_POOLER = os.getenv("POSTGRES_URI_POOLER")
-
-if not POSTGRES_URI:
-    raise ValueError("POSTGRES_URI not set")
-if not POSTGRES_URI_POOLER:
-    raise ValueError("POSTGRES_URI_POOLER not set")
-
-_init_locks: Dict[str, asyncio.Lock]={}
-_locks_lock=Lock()
-
-async def get_init_lock(business_id):
-    """Get or create a lock for a particular business ID.
-    
-    Prevents thundering herd scenario during RAG initialization.
-    """
-    async with _locks_lock:
-        if business_id not in _init_locks:
-            _init_locks[business_id] = asyncio.Lock()
-
-            # Simple cleanup: remove oldest locks if cache grows too large
-            if len(_init_locks) > 1000:
-                # Remove first 100 locks
-                to_remove = list(_init_locks.keys())[:100]
-                for key in to_remove:
-                    del _init_locks[key]
-
-        return _init_locks[business_id]
-    
-
-from tenacity import (
-    retry, retry_if_exception_type, 
-    stop_after_delay, stop_after_attempt,
-    wait_combine, wait_exponential, wait_random
-)
-import requests
-import aiohttp, urllib3,openai,langchain_core
 WHATSAPP_CHATBOT_EXCEPTIONS = (
     # === NETWORK / HTTP ERRORS ===
     ConnectionError,
@@ -359,7 +326,121 @@ WHATSAPP_CHATBOT_EXCEPTIONS = (
     
 )
 
+# Use DIRECT connection for LangGraph (checkpointer/store)
+POSTGRES_URI = os.getenv("POSTGRES_URI")
+# Use POOLER connection for PGVector
+POSTGRES_URI_POOLER = os.getenv("POSTGRES_URI_POOLER")
 
+if not POSTGRES_URI:
+    raise ValueError("POSTGRES_URI not set")
+if not POSTGRES_URI_POOLER:
+    raise ValueError("POSTGRES_URI_POOLER not set")
+
+# FIND THIS SECTION IN bot.py (around line 320-350) AND REPLACE IT:
+
+@retry(
+    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
+    stop=(stop_after_delay(30) | stop_after_attempt(5)),
+    wait=wait_combine(
+        wait_exponential(multiplier=1, max=10),
+        wait_random(min=0, max=2)
+    )
+)
+async def get_pool() -> AsyncConnectionPool:
+    """Get or create the database connection pool with retry logic."""
+    global _pool
+    
+    if _pool is None:
+        logger.info("📦 Creating database connection pool...")
+        
+        clean_uri = POSTGRES_URI.split('?')[0]
+        
+        try:
+            _pool = AsyncConnectionPool(
+                conninfo=clean_uri,
+                min_size=1,
+                max_size=10,
+                open=False,
+                timeout=30,
+                max_waiting=5,
+                max_lifetime=1800,  # ✅ 30 minutes - connections recycled before timeout
+                max_idle=300,       # ✅ 5 minutes - close idle connections
+                # 🔥 ADD THESE NEW PARAMETERS:
+                reconnect_timeout=60.0,  # Retry reconnection for 60 seconds
+                num_workers=3,           # Use connection pool workers
+            )
+            
+            await _pool.open(wait=True, timeout=30)
+            
+            # Test connection
+            async with _pool.connection() as conn:
+                result = await conn.execute("SELECT 1")
+                await result.fetchone()
+            
+            logger.info("✅ Database pool connected!")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to create pool: {e}")
+            _pool = None
+            raise Exception(f"Database connection failed: {e}")
+    
+    # 🔥 ADD THIS: Check if pool is healthy, recreate if needed
+    try:
+        if _pool and _pool.closed:
+            logger.warning("Pool was closed, recreating...")
+            _pool = None
+            return await get_pool()  # Recursive call to recreate
+    except Exception as e:
+        logger.warning(f"Pool health check failed: {e}")
+        _pool = None
+        return await get_pool()
+    
+    return _pool
+
+
+async def ensure_pool_health():
+    """Ensure the connection pool is healthy before use."""
+    global _pool
+    
+    if _pool is None:
+        return await get_pool()
+    
+    try:
+        # Quick health check
+        async with _pool.connection() as conn:
+            await conn.execute("SELECT 1")
+        return _pool
+    except Exception as e:
+        logger.warning(f"Pool unhealthy, recreating: {e}")
+        try:
+            await _pool.close()
+        except:
+            pass
+        _pool = None
+        return await get_pool()
+
+
+_init_locks: Dict[str, asyncio.Lock]={}
+_locks_lock=asyncio.Lock()
+
+async def get_init_lock(business_id):
+    """Get or create a lock for a particular business ID.
+    
+    Prevents thundering herd scenario during RAG initialization.
+    """
+    async with _locks_lock:
+        if business_id not in _init_locks:
+            _init_locks[business_id] = asyncio.Lock()
+
+            # Simple cleanup: remove oldest locks if cache grows too large
+            if len(_init_locks) > 1000:
+                # Remove first 100 locks
+                to_remove = list(_init_locks.keys())[:100]
+                for key in to_remove:
+                    del _init_locks[key]
+
+        return _init_locks[business_id]
+    
 store = None
 saver = None
 
@@ -390,7 +471,7 @@ async def create_tables_manually():
     """Create tables using the connection pool instead of direct connection"""
     print("Creating tables manually via connection pool...")
     
-    pool = await get_pool()
+    pool = await ensure_pool_health()
     
     async with pool.connection() as conn:
         # Create store table
@@ -468,43 +549,6 @@ async_session_maker = None
         wait_random(min=0, max=1)  # ✅ Reduced from max=2
     )
 )
-async def get_pool() -> AsyncConnectionPool:
-    """Get or create the database connection pool."""
-    global _pool
-    
-    if _pool is None:
-        print("📦 Creating database connection pool...")
-        
-        clean_uri = POSTGRES_URI.split('?')[0]
-        
-        try:
-            _pool = AsyncConnectionPool(
-                conninfo=clean_uri,
-                min_size=1,
-                max_size=10,
-                open=False,
-                timeout=15,  # ✅ Reduced from 30
-                max_waiting=5,
-                max_lifetime=1800,
-                max_idle=300,
-            )
-            
-            await _pool.open(wait=True, timeout=15)  # ✅ Reduced from 30
-            
-            # Quick test
-            async with _pool.connection() as conn:
-                result = await conn.execute("SELECT 1")
-                await result.fetchone()
-            
-            print("✅ Database pool ready\n")
-            
-        except Exception as e:
-            print(f"❌ Pool creation failed: {e}\n")
-            _pool = None
-            raise
-    
-    return _pool
-
 async def setup_database():
     """Setup database tables and return store and saver instances."""
     global store, saver
@@ -512,26 +556,66 @@ async def setup_database():
     logger.info("=== SETUP_DATABASE CALLED ===")
     
     try:
-        pool = await get_pool()
+        pool = await ensure_pool_health()
         
-        # Skip table creation in production
-        if os.getenv("SKIP_TABLE_CREATION") != "true":
-            # Only run table creation on first deploy
-            async with pool.connection() as conn:
-                # ... all your CREATE TABLE statements ...
-                pass
-        else:
-            logger.info("⏭️ Skipping table creation (production mode)")
+        # Create required tables
+        async with pool.connection() as conn:
+            # Create user_profiles table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    business_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    name TEXT,
+                    location TEXT,
+                    address TEXT,
+                    cart JSONB,
+                    human_active BOOLEAN,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (business_id, user_id)
+                );
+            """)
+            logger.info("✓ user_profiles table created/verified")
+            
+            # Create business_documents table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS business_documents (
+                    business_id TEXT PRIMARY KEY,
+                    document_path TEXT NOT NULL,
+                    document_name TEXT,
+                    document_type TEXT,
+                    status TEXT DEFAULT 'active',
+                    metadata JSONB,
+                    uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            logger.info("✓ business_documents table created/verified")
+            
+            # Create indexes
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_user_profiles_business 
+                ON user_profiles(business_id);
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_business_documents_status 
+                ON business_documents(status) WHERE status = 'active';
+            """)
+            logger.info("✓ Indexes created/verified")
         
         # Create store and saver
         store = AsyncPostgresStore(pool)
         saver = AsyncPostgresSaver(pool)
         
+        # Setup store and saver (creates their tables)
+        await store.setup()
+        await saver.setup()
+        
         logger.info("=== DATABASE READY ===")
         return store, saver
         
     except Exception as e:
-        logger.error(f"❌ Database setup failed: {e}")
+        logger.error(f"❌ Database setup failed: {e}", exc_info=True)
         raise
 
 async def register_business_document(
@@ -562,7 +646,7 @@ async def register_business_document(
         metadata=metadata
     )
     
-    pool = await get_pool()
+    pool = await ensure_pool_health()
     
     async with pool.connection() as conn:
         await conn.execute(
@@ -590,7 +674,7 @@ async def register_business_document(
 
 async def get_business_document(business_id: str) -> Optional[str]:
     """Get the document path for a business."""
-    pool = await get_pool()
+    pool = await ensure_pool_health()
     
     async with pool.connection() as conn:
         result = await conn.execute(
@@ -619,7 +703,7 @@ async def get_business_document(business_id: str) -> Optional[str]:
 
 async def list_business_documents() -> list[BusinessDocument]:
     """List all registered business documents."""
-    pool = await get_pool()
+    pool = await ensure_pool_health()
     
     async with pool.connection() as conn:
         result = await conn.execute(
@@ -646,7 +730,7 @@ async def list_business_documents() -> list[BusinessDocument]:
 
 async def deactivate_business_document(business_id: str):
     """Deactivate a business document (soft delete)."""
-    pool = await get_pool()
+    pool = await ensure_pool_health()
     
     async with pool.connection() as conn:
         await conn.execute(
@@ -757,7 +841,7 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
         )
     
     # Convert cart to JSON string before inserting
-    pool = await get_pool()
+    pool = await ensure_pool_health()
     async with pool.connection() as conn:
         # Convert cart to JSON - handle both list and dict formats
         cart_json = json.dumps(profile_data.cart) if profile_data.cart is not None else None
@@ -884,7 +968,7 @@ async def add_to_cart(state: MessagesState, config: RunnableConfig):
         }
     
     try:
-        pool = await get_pool()
+        pool = await ensure_pool_health()
         
         async with pool.connection() as conn:
             # Get current cart
@@ -1058,7 +1142,7 @@ async def remove_cart_item(state: MessagesState, config: RunnableConfig):
         }
 
     try:
-        pool = await get_pool()
+        pool = await ensure_pool_health()
 
         async with pool.connection() as conn:
             # ---- Load cart ----
@@ -1231,9 +1315,8 @@ async def get_file_hash(path):
         wait_random(min=0, max=2)
     )
 )
-
-async def initialize_rag(business_id=None, doc_path=None):
-    """Initialize RAG system with Supabase pgvector. Call once at startup per business."""
+async def initialize_rag(business_id: str = None, doc_path: str = None, doc_paths: List = None):
+    """Initialize RAG - accepts single doc_path or multiple doc_paths"""
     global _vector_store_cache, _retriever_cache, _file_hash_cache, _embeddings_cache, _documents_loaded
     
     # Validate business_id
@@ -1245,15 +1328,16 @@ async def initialize_rag(business_id=None, doc_path=None):
         print(f"RAG already initialized for business {business_id}")
         return _retriever_cache[business_id]
     
-    # Get document path from database if not explicitly provided
-    if not doc_path:
-        doc_path = await get_business_document(business_id)
-        
-        if not doc_path:
-            raise ValueError(
-                f"No document registered for business '{business_id}'. "
-                f"Please register a document first using register_business_document()."
-            )
+    
+    # Handle both parameter names
+    if doc_path and not doc_paths:
+        doc_paths = [doc_path]
+    
+    if not doc_paths:
+        doc_paths = await get_business_document(business_id)
+        if not doc_paths:
+            raise ValueError(f"No document for business '{business_id}'")
+        doc_paths = [doc_paths]
     
     try:
         # Initialize embeddings once and store in global cache (shared across businesses)
@@ -1275,15 +1359,17 @@ async def initialize_rag(business_id=None, doc_path=None):
             collection_name=collection_name,
             connection=POSTGRES_URI_POOLER,
             use_jsonb=True,
+            async_mode=True,
+            pre_delete_collection=False,
+            create_extension=False, 
         )
         
         # Check if documents exist in THIS specific collection using database query
         try:
             print(f"Checking database for documents in collection: {collection_name}...")
-            pool = await get_pool()
+            pool = await ensure_pool_health()
             
             async with pool.connection() as conn:
-                # Query the actual PGVector tables to check if THIS collection has documents
                 result = await conn.execute(
                     """
                     SELECT COUNT(*) 
@@ -1302,90 +1388,182 @@ async def initialize_rag(business_id=None, doc_path=None):
                 print(f"Found {doc_count} documents in collection {collection_name}")
                 
                 if doc_count > 0:
-                    # Check if file has changed
-                    current_hash = await get_file_hash(doc_path)
+                    # Check if any file has changed
+                    doc_paths_list = doc_paths if isinstance(doc_paths, list) else [doc_paths]
+                    current_hashes = await asyncio.gather(*[get_file_hash(path) for path in doc_paths_list])
                     
-                    if business_id in _file_hash_cache and _file_hash_cache[business_id] != current_hash:
-                        print(f"Document file has changed for business {business_id}, will refresh...")
-                        await refresh_rag(business_id=business_id, doc_path=doc_path)
+                    if business_id in _file_hash_cache and _file_hash_cache[business_id] != current_hashes:
+                        print(f"Document files have changed for business {business_id}, will refresh...")
+                        await refresh_rag(business_id=business_id, doc_paths=doc_paths)
                         return _retriever_cache[business_id]
                     
-                    # Documents exist and file hasn't changed
-                    _file_hash_cache[business_id] = current_hash
+                    # Documents exist and files haven't changed
+                    _file_hash_cache[business_id] = current_hashes
                     _documents_loaded[business_id] = True
                     _vector_store_cache[business_id] = vector_store
                     _retriever_cache[business_id] = vector_store.as_retriever(search_kwargs={"k": 5})
                     print(f"RAG initialized from existing documents for business {business_id}")
                     return _retriever_cache[business_id]
                 else:
-                    print(f"No documents found in collection {collection_name}, will load from file: {doc_path}")
+                    print(f"No documents found in collection {collection_name}, will load from files")
                     
         except Exception as e:
             print(f"Error checking collection for business {business_id}: {e}")
-            print("Will proceed to load documents from file...")
+            print("Will proceed to load documents from files...")
         
         # Load and process documents
-        print(f"Building knowledge base from file for business {business_id}...")
+        print(f"Building knowledge base from files for business {business_id}...")
         splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
-        all_documents = []
         
-        # Load from document
-        if doc_path and os.path.exists(doc_path):
-            print(f"Processing {doc_path}")
-            if doc_path.lower().endswith(".pdf"):
-                loader = PyPDFLoader(doc_path)
-            elif doc_path.lower().endswith(".docx"):
-                loader = Docx2txtLoader(doc_path)
-            elif doc_path.lower().endswith(".csv"):
-                loader = CSVLoader(file_path=doc_path, encoding="utf-8-sig")
-            else:
-                raise ValueError(f"Unsupported file format: {doc_path}")
-            
-            loop = asyncio.get_event_loop()
+        # Configuration
+        DOC_LOAD_BATCH_SIZE = 5      
+        EMBEDDING_BATCH_SIZE = 256    
+        VECTOR_INSERT_BATCH_SIZE = 100
+                
+        # Ensure doc_paths is a list
+        doc_paths_list = doc_paths if isinstance(doc_paths, list) else [doc_paths]
+        all_documents = []
 
-            if hasattr(loader, 'aload'):
-                docs = await loader.aload()
-                doc_chunks = await loop.run_in_executor(None, splitter.split_documents, docs)
-                all_documents.extend(doc_chunks)
-                print(f"Loaded {len(doc_chunks)} chunks from {doc_path}")
-            else:
-                docs = await loop.run_in_executor(None, loader.load)
-                doc_chunks = await loop.run_in_executor(None, splitter.split_documents, docs)
-                all_documents.extend(doc_chunks)
-                print(f"Loaded {len(doc_chunks)} chunks from {doc_path}")
-        else:
-            raise ValueError(f"Document path does not exist: {doc_path}")
+        # Process documents in batches to avoid memory issues
+        print(f"Processing {len(doc_paths_list)} documents in batches of {DOC_LOAD_BATCH_SIZE}...")
+        
+        for batch_idx in range(0, len(doc_paths_list), DOC_LOAD_BATCH_SIZE):
+            batch_paths = doc_paths_list[batch_idx:batch_idx + DOC_LOAD_BATCH_SIZE]
+            print(f"\nProcessing batch {batch_idx//DOC_LOAD_BATCH_SIZE + 1}/{(len(doc_paths_list) + DOC_LOAD_BATCH_SIZE - 1)//DOC_LOAD_BATCH_SIZE}")
+            
+            # Load documents in this batch
+            loaded_docs = []
+            for doc_path in batch_paths:
+                if not doc_path or not os.path.exists(doc_path):
+                    raise ValueError(f"Document path does not exist: {doc_path}")
+                    
+                print(f"  Loading {os.path.basename(doc_path)}...")
+                if doc_path.lower().endswith(".pdf"):
+                    loader = PyPDFLoader(doc_path)
+                elif doc_path.lower().endswith(".docx"):
+                    loader = Docx2txtLoader(doc_path)
+                elif doc_path.lower().endswith(".csv"):
+                    loader = CSVLoader(file_path=doc_path, encoding="utf-8-sig")
+                else:
+                    raise ValueError(f"Unsupported file format: {doc_path}")
+                
+                if hasattr(loader, 'aload'):
+                    docs = await loader.aload()
+                else:
+                    docs = await loop.run_in_executor(None, loader.load)
+                
+                loaded_docs.append(docs)
+                print(f"    Loaded {len(docs)} pages/rows")
+
+            # Split documents in this batch in parallel
+            print(f"  Splitting {len(loaded_docs)} documents in parallel...")
+            chunk_results = await asyncio.gather(*[
+                loop.run_in_executor(None, splitter.split_documents, docs)
+                for docs in loaded_docs
+            ])
+
+            # Flatten chunks from this batch
+            batch_chunks = []
+            for chunks in chunk_results:
+                batch_chunks.extend(chunks)
+            
+            all_documents.extend(batch_chunks)
+            print(f"  Created {len(batch_chunks)} chunks from this batch (Total: {len(all_documents)})")
 
         if not all_documents:
             raise ValueError("No documents were loaded")
 
-        # Store file hash per business
-        _file_hash_cache[business_id] = await get_file_hash(doc_path)
+        print(f"\nTotal chunks created: {len(all_documents)}")
+
+        # Store file hashes per business
+        _file_hash_cache[business_id] = await asyncio.gather(*[get_file_hash(path) for path in doc_paths_list])
         
-        print(f"Adding {len(all_documents)} document chunks to Supabase for business {business_id}...")
-        print("This may take a few minutes for large datasets...")
+        # ============================================================
+        # BATCH EMBEDDING GENERATION (Safe and Fast)
+        # ============================================================
+        print(f"\nGenerating embeddings for {len(all_documents)} chunks...")
+        print(f"Using batch size of {EMBEDDING_BATCH_SIZE} for optimal performance")
         
-        # Add documents to PGVector in batches for better performance
-        if hasattr(vector_store, 'aadd_documents'):
-            batch_size = 100
-            for i in range(0, len(all_documents), batch_size):
-                batch = all_documents[i:i+batch_size]
-                await vector_store.add_documents(batch)
-                print(f"  Progress: {min(i+batch_size, len(all_documents))}/{len(all_documents)} documents added")
+        texts = [doc.page_content for doc in all_documents]
+        metadatas = [doc.metadata for doc in all_documents]
+        all_embeddings = []
         
-        else:
-            # Fallback if no .aadd_document method
-            loop = asyncio.get_event_loop()
-            batch_size= 100
-            for i in range(0, len(all_documents), batch_size):
-                batch= all_documents[i:i+batch_size]
-                await loop.run_in_executor(None, lambda b=batch: vector_store.add_documents(b))
-                print(f"  Progress: {min(i+batch_size, len(all_documents))}/{len(all_documents)} documents added")
+        # Generate embeddings in batches using the model's native batching
+        for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+            batch_texts = texts[i:i + EMBEDDING_BATCH_SIZE]
+            
+            # Use embed_documents (plural) - this is thread-safe and internally optimized
+            batch_embeddings = await loop.run_in_executor(
+                None,
+                _embeddings_cache.embed_documents,  # Native batch method
+                batch_texts
+            )
+            
+            all_embeddings.extend(batch_embeddings)
+            
+            progress = min(i + EMBEDDING_BATCH_SIZE, len(texts))
+            print(f"  Embeddings: {progress}/{len(texts)} ({progress*100//len(texts)}%)")
+        
+        print(f"✓ Generated {len(all_embeddings)} embeddings")
+        
+        # ============================================================
+        # ADD PRE-EMBEDDED DOCUMENTS TO VECTOR STORE
+        # ============================================================
+        print(f"\nAdding {len(all_embeddings)} pre-embedded documents to Supabase...")
+        print(f"Using insert batch size of {VECTOR_INSERT_BATCH_SIZE}")
+        
+        # Add documents with pre-computed embeddings in batches
+        for i in range(0, len(all_embeddings), VECTOR_INSERT_BATCH_SIZE):
+            batch_size = min(VECTOR_INSERT_BATCH_SIZE, len(all_embeddings) - i)
+            
+            batch_texts = texts[i:i + batch_size]
+            batch_embeddings = all_embeddings[i:i + batch_size]
+            batch_metadatas = metadatas[i:i + batch_size]
+            
+            # Create tuples of (text, embedding) as required by add_embeddings
+            text_embedding_pairs = list(zip(batch_texts, batch_embeddings))
+            
+            # Add to vector store with pre-computed embeddings
+            if hasattr(vector_store, 'aadd_embeddings'):
+                # await vector_store.aadd_embeddings(
+                #     text_embeddings=text_embedding_pairs,
+                #     metadatas=batch_metadatas
+                # )
+                await vector_store.aadd_embeddings(
+                    texts=batch_texts,
+                    embeddings=batch_embeddings,
+                    metadatas=batch_metadatas
+                )
+            elif hasattr(vector_store, 'add_embeddings'):
+                await loop.run_in_executor(
+                    None,
+                    vector_store.add_embeddings,
+                    text_embedding_pairs,
+                    batch_metadatas
+                )
+            else:
+                # Fallback: reconstruct documents with embeddings
+                # This shouldn't re-compute embeddings since we're providing them
+                batch_docs = [
+                    type(all_documents[i + j])(
+                        page_content=batch_texts[j],
+                        metadata=batch_metadatas[j]
+                    )
+                    for j in range(len(batch_texts))
+                ]
+                
+                if hasattr(vector_store, 'aadd_documents'):
+                    await vector_store.aadd_documents(batch_docs)
+                else:
+                    await loop.run_in_executor(None, vector_store.add_documents, batch_docs)
+            
+            progress = min(i + batch_size, len(all_embeddings))
+            print(f"  Progress: {progress}/{len(all_embeddings)} ({progress*100//len(all_embeddings)}%)")
         
         _documents_loaded[business_id] = True
         _vector_store_cache[business_id] = vector_store
         _retriever_cache[business_id] = vector_store.as_retriever(search_kwargs={"k": 5})
-        print(f"Setup complete - {len(all_documents)} documents indexed in Supabase for business {business_id}!")
+        print(f"\nSetup complete - {len(all_documents)} documents indexed in Supabase for business {business_id}!")
         
         return _retriever_cache[business_id]
       

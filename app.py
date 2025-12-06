@@ -3,20 +3,17 @@ import asyncio
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    # Also set it on the current running loop if one exists
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # No loop running yet, create one with the right policy
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
 
 import uvicorn
 import os
 import logging
 import uuid
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, Dict, Set
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -26,8 +23,18 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage
 
-from bot import initialize_graph,setup_database,get_pool,initialize_rag,start_file_monitoring,refresh_rag,store,saver
-
+from bot import (
+    initialize_graph, 
+    setup_database, 
+    get_pool,
+    ensure_pool_health,  
+    initialize_rag, 
+    start_file_monitoring, 
+    refresh_rag,
+    register_business_document,
+    store, 
+    saver
+)
 
 # Setup logging
 logging.basicConfig(
@@ -42,7 +49,7 @@ ALLOWED_EXTENSIONS: Set[str] = {".pdf", ".csv", ".xlsx", ".doc", ".docx", ".txt"
 
 # Global state
 graph = None
-rag_initialized = {}
+rag_initialized_businesses: Dict[str, bool] = {}
 file_observers = {}
 db_initialized = False
 
@@ -77,16 +84,16 @@ async def lifespan(app: FastAPI):
         try:
             observer.stop()
             observer.join()
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error stopping observer: {e}")
     
     try:
         pool = await get_pool()
         if pool and not pool.closed:
             await pool.close()
-    except:
-        pass
-
+            logger.info("Database pool closed")
+    except Exception as e:
+        logger.error(f"Error closing database pool: {e}")
 
 
 # Initialize FastAPI app
@@ -107,7 +114,10 @@ app.add_middleware(
 )
 
 
-# Pydantic models
+# ============================================================================
+# PYDANTIC MODELS
+# ============================================================================
+
 class ChatRequest(BaseModel):
     business_id: str = Field(..., description="Unique identifier for the business")
     user_id: str = Field(..., description="Unique identifier for the user/customer")
@@ -147,7 +157,10 @@ class HealthResponse(BaseModel):
     database: str
     rag_systems: Dict[str, bool]
 
-# Add this function right after the lifespan function (before app = FastAPI...)
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 
 async def ensure_db_initialized():
     """Initialize database on first request (lazy initialization)."""
@@ -159,37 +172,9 @@ async def ensure_db_initialized():
     logger.info("🔧 Initializing database on first request...")
     
     try:
-        # Now initialize the full graph with database
         graph = await initialize_graph()
         db_initialized = True
         logger.info("✅ Database initialized successfully")
-    except Exception as e:
-        logger.error(f"❌ Database initialization failed: {e}")
-        raise HTTPException(
-            status_code=503,
-            detail=f"Database initialization failed: {str(e)}"
-        )
-
-async def ensure_db_initialized():
-    """Initialize database on first request (lazy initialization)."""
-    global graph, db_initialized
-    
-    logger.info(f"ensure_db_initialized called. Current status: {db_initialized}")
-    
-    if db_initialized:
-        logger.info("DB already initialized, returning immediately")
-        return
-    
-    logger.info("🔧 Initializing database on first request...")
-    
-    try:
-        logger.info("Calling initialize_graph()...")
-        graph = await initialize_graph()
-        logger.info("initialize_graph() completed")
-        
-        db_initialized = True
-        logger.info("✅ Database initialized successfully")
-        
     except Exception as e:
         logger.error(f"❌ Database initialization failed: {e}", exc_info=True)
         raise HTTPException(
@@ -198,22 +183,47 @@ async def ensure_db_initialized():
         )
 
 
+async def ensure_rag_initialized(business_id: str):
+    """Ensure RAG is initialized for a specific business."""
+    if business_id in rag_initialized_businesses:
+        return
+    
+    logger.info(f"🔧 Initializing RAG for business: {business_id}")
+    
+    try:
+        await initialize_rag(business_id=business_id)
+        rag_initialized_businesses[business_id] = True
+        logger.info(f"✅ RAG initialized for business: {business_id}")
+    except Exception as e:
+        logger.error(f"❌ RAG initialization failed for {business_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"RAG initialization failed for business {business_id}: {str(e)}"
+        )
+
+
 def allowed_file(filename: str) -> bool:
-    """Checks if a filename has an allowed extension."""
+    """Check if a filename has an allowed extension."""
     return Path(filename).suffix.lower() in ALLOWED_EXTENSIONS
 
 
-def process_and_refresh_rag_task(business_id: str, file_path: Path):
-    """Synchronous task to be run in the background to refresh RAG."""
+async def process_and_refresh_rag_task(business_id: str, file_path: Path):
+    """Async background task to refresh RAG after file upload."""
     logger.info(f"Background task: Processing {file_path} for business {business_id}")
     try:
-        asyncio.run(refresh_rag(business_id=business_id, doc_path=str(file_path)))
-        logger.info(f"Background task: RAG refreshed successfully for {business_id} with file {file_path.name}")
+        # FIXED: Use doc_path (singular) to match bot.py
+        await refresh_rag(business_id=business_id, doc_path=str(file_path))
+        rag_initialized_businesses[business_id] = True
+        logger.info(f"✅ Background task: RAG refreshed for {business_id} with file {file_path.name}")
     except Exception as e:
-        logger.error(f"Background RAG refresh failed for {business_id} with {file_path.name}: {e}")
+        logger.error(f"❌ Background RAG refresh failed for {business_id}: {e}", exc_info=True)
+        # Mark as not initialized so it can retry on next request
+        rag_initialized_businesses.pop(business_id, None)
 
 
-# API Endpoints
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
 
 @app.get("/", tags=["Health"])
 async def root():
@@ -233,9 +243,11 @@ async def health_check():
     
     if db_initialized:
         try:
-            pool = await asyncio.wait_for(get_pool(), timeout=2.0)
+            pool = await asyncio.wait_for(ensure_pool_health(), timeout=2.0) 
+            
             async with pool.connection() as conn:
-                await conn.execute("SELECT 1")
+                result = await conn.execute("SELECT 1")
+                await result.fetchone()
             db_status = "connected"
         except asyncio.TimeoutError:
             db_status = "timeout"
@@ -245,11 +257,10 @@ async def health_check():
     else:
         db_status = "initializing"
     
-    # Always return healthy so Render doesn't kill the service
     return {
         "status": "healthy",
         "database": db_status,
-        "rag_systems": rag_initialized
+        "rag_systems": rag_initialized_businesses
     }
 
 
@@ -259,79 +270,95 @@ async def upload_document(
     document_file: UploadFile = File(...),
     background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
-    """Upload document and trigger RAG refresh."""
+    """Upload document and trigger RAG refresh in background."""
     
     try:
         logger.info(f"=== UPLOAD REQUEST STARTED ===")
-        logger.info(f"Business ID: {business_id}")
-        logger.info(f"Filename: {document_file.filename}")
         
-        logger.info("Step 1: Ensuring DB initialized...")
+        # Ensure DB is ready
         await ensure_db_initialized()
-        logger.info("Step 1: ✅ DB initialized")
         
-        logger.info("Step 2: Validating filename...")
+        # Validate and save file (existing code)
         filename = document_file.filename
-        
         if not filename or not allowed_file(filename):
-            logger.error(f"Invalid file type: {filename}")
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
-            )
-        logger.info(f"Step 2: ✅ Filename valid: {filename}")
-
-        logger.info("Step 3: Creating upload directory...")
+            raise HTTPException(status_code=400, detail=f"Invalid file type")
+        
         business_upload_dir = UPLOAD_ROOT_PATH / business_id
         business_upload_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Step 3: ✅ Directory created: {business_upload_dir}")
         
-        logger.info("Step 4: Saving file...")
         file_extension = Path(filename).suffix
         unique_filename = f"{uuid.uuid4().hex}{file_extension}"
         file_path = business_upload_dir / unique_filename
         
         content = await document_file.read()
-        logger.info(f"Step 4a: File read, size: {len(content)} bytes")
-        
         await asyncio.to_thread(file_path.write_bytes, content)
-        logger.info(f"Step 4: ✅ File saved to {file_path}")
         
-        logger.info("Step 5: Adding background task...")
+        # Register document in database
+        await register_business_document(
+            business_id=business_id,
+            document_path=str(file_path),
+            document_name=filename,
+            document_type=file_extension.replace('.', '').lower()
+        )
+        
+        # 🔥 KEY CHANGE: Add RAG refresh to background task
+        # Client gets immediate response, RAG processes in background
         background_tasks.add_task(process_and_refresh_rag_task, business_id, file_path)
-        logger.info("Step 5: ✅ Background task added")
         
         logger.info("=== UPLOAD REQUEST COMPLETED ===")
         
-        return JSONResponse(content={
-            "status": "processing",
-            "message": f"Document '{filename}' uploaded successfully.",
-            "file_id": unique_filename,
-            "business_id": business_id
-        }, status_code=202)
+        # ✅ Return 202 (Accepted) - processing in background
+        return JSONResponse(
+            content={
+                "status": "processing",
+                "message": f"Document '{filename}' uploaded. RAG initialization in progress.",
+                "file_id": unique_filename,
+                "business_id": business_id,
+                # 🔥 ADD: Tell client to check status endpoint
+                "check_status_url": f"/rag/status/{business_id}"
+            }, 
+            status_code=202
+        )
         
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"❌ UPLOAD FAILED: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
+
+@app.get("/rag/status/{business_id}", tags=["Knowledge Base"])
+async def get_rag_status(business_id: str):
+    """Check if RAG is initialized and ready for a business."""
+    return {
+        "business_id": business_id,
+        "rag_initialized": rag_initialized_businesses.get(business_id, False),
+        "status": "ready" if rag_initialized_businesses.get(business_id) else "initializing"
+    }
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(request: ChatRequest):
     """Send a message to the assistant and get a response."""
     
-    # ADD THIS LINE FIRST
-    await ensure_db_initialized()
-    
     try:
-        # Ensure RAG is initialized for this business
-        await ensure_rag_initialized(request.business_id)
+        # Ensure database is initialized
+        await ensure_db_initialized()
         
-        # Generate thread_id if not provided
+        # 🔥 KEY CHANGE: Check if RAG is ready, don't wait for it
+        if request.business_id not in rag_initialized_businesses:
+            # Try to initialize (non-blocking check)
+            try:
+                await ensure_rag_initialized(request.business_id)
+            except Exception as e:
+                # RAG not ready yet - return helpful message
+                return ChatResponse(
+                    response="Our knowledge base is still being prepared. Please try again in a few moments. You can check status at /rag/status/" + request.business_id,
+                    thread_id=request.thread_id or f"{request.business_id}_{request.user_id}_temp",
+                    business_id=request.business_id,
+                    user_id=request.user_id
+                )
+        
+        # RAG is ready, proceed with chat
         thread_id = request.thread_id or f"{request.business_id}_{request.user_id}_{uuid.uuid4().hex[:8]}"
         
-        # Prepare config
         config = {
             "configurable": {
                 "thread_id": thread_id,
@@ -340,25 +367,26 @@ async def chat(request: ChatRequest):
             }
         }
         
-        # Create input state with HumanMessage
         input_state = {
             "messages": [HumanMessage(content=request.message)]
         }
         
-        logger.info(f"Processing message from user {request.user_id} (business: {request.business_id})")
+        logger.info(f"Processing message from user {request.user_id}")
         
-        # Invoke the graph
-        result = await graph.ainvoke(input_state, config)
+        result = await asyncio.wait_for(
+            graph.ainvoke(input_state, config),
+            timeout=30.0
+        )
         
-        # Extract the last AI message
-        ai_messages = [msg for msg in result["messages"] if hasattr(msg, 'content') and msg.__class__.__name__ == 'AIMessage']
+        ai_messages = [
+            msg for msg in result["messages"] 
+            if hasattr(msg, 'content') and msg.__class__.__name__ == 'AIMessage'
+        ]
         
         if not ai_messages:
             raise HTTPException(status_code=500, detail="No response generated")
         
         response_text = ai_messages[-1].content
-        
-        logger.info(f"Generated response for user {request.user_id}")
         
         return ChatResponse(
             response=response_text,
@@ -367,16 +395,21 @@ async def chat(request: ChatRequest):
             user_id=request.user_id
         )
     
+    except asyncio.TimeoutError:
+        logger.error(f"Chat timeout for user {request.user_id}")
+        raise HTTPException(status_code=504, detail="Request timeout - please try again")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Chat endpoint error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to process message: {str(e)}")
 
-
 @app.post("/rag/initialize", tags=["Knowledge Base"])
 async def initialize_rag_endpoint(request: InitRAGRequest):
+    """Initialize RAG system for a business."""
     try:
-
         await ensure_db_initialized()
+        await ensure_rag_initialized(request.business_id)
         
         return {
             "status": "success",
@@ -391,12 +424,12 @@ async def initialize_rag_endpoint(request: InitRAGRequest):
 
 @app.post("/rag/refresh", tags=["Knowledge Base"])
 async def refresh_rag_endpoint(request: RefreshRAGRequest):
-    """
-    Refresh RAG system for a business (e.g., when knowledge base is updated).
-    """
+    """Refresh RAG system for a business (e.g., when knowledge base is updated)."""
     try:
-        await ensure_db_initialized() 
+        await ensure_db_initialized()
+        # FIXED: Use doc_path (singular) to match bot.py
         await refresh_rag(business_id=request.business_id, doc_path=request.doc_path)
+        rag_initialized_businesses[request.business_id] = True
         
         return {
             "status": "success",
@@ -411,12 +444,11 @@ async def refresh_rag_endpoint(request: RefreshRAGRequest):
 
 @app.get("/profile/{business_id}/{user_id}", response_model=UserProfileResponse, tags=["User Profile"])
 async def get_user_profile(business_id: str, user_id: str):
-    """
-    Retrieve a user's profile information.
-    """
+    """Retrieve a user's profile information."""
     try:
-        await ensure_db_initialized() 
-        pool = await get_pool()
+        await ensure_db_initialized()
+        
+        pool = await ensure_pool_health()
         
         async with pool.connection() as conn:
             result = await conn.execute(
@@ -461,12 +493,11 @@ async def get_user_profile(business_id: str, user_id: str):
 
 @app.delete("/profile/{business_id}/{user_id}", tags=["User Profile"])
 async def delete_user_profile(business_id: str, user_id: str):
-    """
-    Delete a user's profile and conversation history.
-    """
+    """Delete a user's profile."""
     try:
         await ensure_db_initialized()
-        pool = await get_pool()
+
+        pool = await ensure_pool_health()
         
         async with pool.connection() as conn:
             # Delete from user_profiles table
@@ -495,11 +526,10 @@ async def delete_user_profile(business_id: str, user_id: str):
 
 
 @app.get("/conversations/{business_id}/{user_id}", tags=["Conversations"])
-async def get_conversation_history(business_id: str, user_id: str, thread_id: Optional[str] = None):
-    """
-    Retrieve conversation history for a user from the store.
-    """
+async def get_conversation_history(business_id: str, user_id: str):
+    """Retrieve conversation history for a user from the store."""
     try:
+        await ensure_db_initialized()
         namespace = ("profile", business_id, user_id)
         
         # Get user memory from store
@@ -524,38 +554,11 @@ async def get_conversation_history(business_id: str, user_id: str, thread_id: Op
         raise HTTPException(status_code=500, detail=f"Failed to retrieve conversations: {str(e)}")
 
 
-# Add this to the BOTTOM of your app.py file (replace existing if __name__ == "__main__")
-import logging
-logging.basicConfig(level=logging.INFO)
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logging.info(f"Starting server on port {port}")
+    logger.info(f"Starting server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
-# if __name__ == "__main__":
-#     import sys
-#     import asyncio
-#     import uvicorn
-    
-#     # Set event loop policy BEFORE creating the loop
-#     if sys.platform == 'win32':
-#         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
-#     # Create and set the event loop with the correct policy
-#     loop = asyncio.new_event_loop()
-#     asyncio.set_event_loop(loop)
-    
-#     print("✅ Event loop policy set and loop created with WindowsSelectorEventLoopPolicy")
-    
-#     # Run uvicorn programmatically with our loop
-#     config = uvicorn.Config(
-#         "app:app",
-#         host="0.0.0.0",
-#         port=8000,
-#         loop="asyncio",  # Use asyncio loop type
-#         reload=False
-#     )
-#     server = uvicorn.Server(config)
-    
-#     # Run with our event loop
-#    loop.run_until_complete(server.serve())
