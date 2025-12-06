@@ -23,6 +23,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage
 
+from concurrent.futures import ThreadPoolExecutor
+background_executor = ThreadPoolExecutor(max_workers=3)
+
 from bot import (
     initialize_graph, 
     setup_database, 
@@ -264,13 +267,19 @@ async def health_check():
     }
 
 
+
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+# Create thread pool for background work (outside of HTTP lifecycle)
+background_executor = ThreadPoolExecutor(max_workers=3)
+
 @app.post("/upload", tags=["Knowledge Base"])
 async def upload_document(
     business_id: str = Form(...),
     document_file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
-    """Upload document and trigger RAG refresh in background."""
+    """Upload document - returns immediately, processes in background."""
     
     try:
         logger.info(f"=== UPLOAD REQUEST STARTED ===")
@@ -278,7 +287,7 @@ async def upload_document(
         # Ensure DB is ready
         await ensure_db_initialized()
         
-        # Validate and save file (existing code)
+        # Validate and save file (FAST - under 5 seconds)
         filename = document_file.filename
         if not filename or not allowed_file(filename):
             raise HTTPException(status_code=400, detail=f"Invalid file type")
@@ -290,10 +299,12 @@ async def upload_document(
         unique_filename = f"{uuid.uuid4().hex}{file_extension}"
         file_path = business_upload_dir / unique_filename
         
+        # Save file
         content = await document_file.read()
         await asyncio.to_thread(file_path.write_bytes, content)
+        logger.info(f"File saved to {file_path}")
         
-        # Register document in database
+        # Register in database (FAST)
         await register_business_document(
             business_id=business_id,
             document_path=str(file_path),
@@ -301,21 +312,27 @@ async def upload_document(
             document_type=file_extension.replace('.', '').lower()
         )
         
-        # 🔥 KEY CHANGE: Add RAG refresh to background task
-        # Client gets immediate response, RAG processes in background
-        background_tasks.add_task(process_and_refresh_rag_task, business_id, file_path)
+        # Mark RAG as processing
+        await mark_rag_processing(business_id)
         
-        logger.info("=== UPLOAD REQUEST COMPLETED ===")
+        # 🔥 KEY FIX: Submit to thread pool (TRULY detached from HTTP request)
+        background_executor.submit(
+            run_rag_in_background,
+            business_id,
+            str(file_path)
+        )
         
-        # ✅ Return 202 (Accepted) - processing in background
+        logger.info("=== UPLOAD REQUEST COMPLETED (background processing started) ===")
+        
+        # ✅ Return IMMEDIATELY (under 5 seconds total)
         return JSONResponse(
             content={
                 "status": "processing",
-                "message": f"Document '{filename}' uploaded. RAG initialization in progress.",
+                "message": f"Document '{filename}' uploaded successfully. Processing in background (estimated 10-15 minutes).",
                 "file_id": unique_filename,
                 "business_id": business_id,
-                # 🔥 ADD: Tell client to check status endpoint
-                "check_status_url": f"/rag/status/{business_id}"
+                "check_status_url": f"/rag/status/{business_id}",
+                "estimated_completion": "10-15 minutes"
             }, 
             status_code=202
         )
@@ -324,6 +341,171 @@ async def upload_document(
         logger.error(f"❌ UPLOAD FAILED: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
+
+def run_rag_in_background(business_id: str, file_path: str):
+    """Run RAG initialization in a completely separate thread.
+    
+    This runs outside the HTTP request lifecycle, so Render won't timeout.
+    """
+    import asyncio
+    
+    try:
+        logger.info(f"Starting background RAG processing for {business_id}")
+        
+        # Create new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Run the async processing
+        loop.run_until_complete(
+            process_and_refresh_rag_task(business_id, Path(file_path))
+        )
+        
+        loop.close()
+        logger.info(f"Background RAG processing completed for {business_id}")
+        
+    except Exception as e:
+        logger.error(f"Background RAG processing failed for {business_id}: {e}", exc_info=True)
+        # Update status to failed
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(mark_rag_failed(business_id, str(e)))
+            loop.close()
+        except Exception as status_error:
+            logger.error(f"Failed to update status: {status_error}")
+
+
+async def mark_rag_processing(business_id: str):
+    """Mark RAG as processing in database."""
+    try:
+        pool = await ensure_pool_health()
+        async with pool.connection() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS rag_status (
+                    business_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    started_at TIMESTAMP DEFAULT NOW(),
+                    error_message TEXT
+                )
+            """)
+            
+            await conn.execute("""
+                INSERT INTO rag_status (business_id, status, started_at)
+                VALUES (%s, 'processing', NOW())
+                ON CONFLICT (business_id) DO UPDATE SET
+                    status = 'processing',
+                    started_at = NOW(),
+                    error_message = NULL
+            """, (business_id,))
+    except Exception as e:
+        logger.error(f"Failed to mark RAG as processing: {e}")
+
+
+async def mark_rag_failed(business_id: str, error: str):
+    """Mark RAG as failed in database."""
+    try:
+        pool = await ensure_pool_health()
+        async with pool.connection() as conn:
+            await conn.execute("""
+                UPDATE rag_status
+                SET status = 'failed', error_message = %s
+                WHERE business_id = %s
+            """, (error, business_id))
+    except Exception as e:
+        logger.error(f"Failed to mark RAG as failed: {e}")
+
+
+# Update the status endpoint to check database
+@app.get("/rag/status/{business_id}", tags=["Knowledge Base"])
+async def get_rag_status(business_id: str):
+    """Check RAG initialization status."""
+    try:
+        pool = await ensure_pool_health()
+        async with pool.connection() as conn:
+            result = await conn.execute("""
+                SELECT status, started_at, error_message
+                FROM rag_status
+                WHERE business_id = %s
+            """, (business_id,))
+            
+            row = await result.fetchone()
+        
+        if not row:
+            return {
+                "business_id": business_id,
+                "status": "not_started",
+                "rag_initialized": False
+            }
+        
+        status, started_at, error_message = row
+        
+        response = {
+            "business_id": business_id,
+            "status": status,
+            "rag_initialized": rag_initialized_businesses.get(business_id, False),
+            "started_at": started_at.isoformat() if started_at else None
+        }
+        
+        if status == "processing" and started_at:
+            elapsed_minutes = (datetime.now() - started_at).total_seconds() / 60
+            response["elapsed_minutes"] = round(elapsed_minutes, 1)
+            response["estimated_remaining"] = max(0, round(15 - elapsed_minutes, 1))
+        
+        if status == "failed":
+            response["error_message"] = error_message
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Failed to get RAG status: {e}")
+        return {
+            "business_id": business_id,
+            "status": "unknown",
+            "rag_initialized": rag_initialized_businesses.get(business_id, False)
+        }
+
+
+# Update process_and_refresh_rag_task to update status
+async def process_and_refresh_rag_task(business_id: str, file_path: Path):
+    """Process RAG with status updates."""
+    try:
+        logger.info(f"Background task: Processing {file_path} for business {business_id}")
+        
+        # Do the work
+        await refresh_rag(business_id=business_id, doc_path=str(file_path))
+        
+        # Mark as completed
+        rag_initialized_businesses[business_id] = True
+        
+        pool = await ensure_pool_health()
+        async with pool.connection() as conn:
+            await conn.execute("""
+                UPDATE rag_status
+                SET status = 'completed'
+                WHERE business_id = %s
+            """, (business_id,))
+        
+        logger.info(f"✅ Background task: RAG completed for {business_id}")
+        
+    except Exception as e:
+        logger.error(f"❌ Background RAG refresh failed for {business_id}: {e}", exc_info=True)
+        
+        # Mark as failed
+        rag_initialized_businesses.pop(business_id, None)
+        
+        try:
+            pool = await ensure_pool_health()
+            async with pool.connection() as conn:
+                await conn.execute("""
+                    UPDATE rag_status
+                    SET status = 'failed', error_message = %s
+                    WHERE business_id = %s
+                """, (str(e), business_id))
+        except Exception as status_error:
+            logger.error(f"Failed to update error status: {status_error}")
+
+            
 @app.get("/rag/status/{business_id}", tags=["Knowledge Base"])
 async def get_rag_status(business_id: str):
     """Check if RAG is initialized and ready for a business."""

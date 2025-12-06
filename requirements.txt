@@ -26,3 +26,42 @@ requests
 aiohttp
 sqlalchemy
 openai
+
+
+# Core
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+pydantic-settings
+
+# Database
+asyncpg
+psycopg[binary,pool]
+psycopg-pool
+sqlalchemy
+
+# LangChain & AI
+langchain
+langchain-community
+langchain-core
+langchain-postgres
+langchain-huggingface
+langchain-groq
+langchain-text-splitters
+langgraph
+langgraph-checkpoint
+
+# Embeddings & Vector Store
+sentence-transformers
+huggingface-hub
+
+# Document Processing
+pypdf
+python-docx
+openpyxl
+httpx
+aiohttp
+requests
+tenacity
+trustcall
