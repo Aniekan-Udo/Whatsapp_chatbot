@@ -31,7 +31,15 @@ from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExp
 
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+try:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    OTEL_AVAILABLE = True
+except ImportError:
+    OTEL_AVAILABLE = False
+    FastAPIInstrumentor = None
+    import warnings
+    warnings.warn("OpenTelemetry not available - monitoring disabled")
+    
 from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
 
 # Logging
