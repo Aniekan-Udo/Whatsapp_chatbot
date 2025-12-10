@@ -2,9 +2,8 @@
 langchain-core
 langchain-community
 langgraph
-langgraph-checkpoint-postgres
 langgraph-store-postgres
-
+langgraph-store
 # LLM Providers
 langchain-groq
 
