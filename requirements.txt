@@ -51,7 +51,7 @@ cryptography
 # Monitoring (recommended additions)
 # prometheus-client==0.21.0
 # sentry-sdk==2.19.2
-
+opentelemetry-instrumentation-fastapi
 opentelemetry-instrumentation-psycopg
 opentelemetry-api
 opentelemetry-sdk
