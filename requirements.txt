@@ -21,7 +21,7 @@ alembic
 # Vector Store & Embeddings
 llama-index-core
 llama-index-vector-stores-postgres
-llama-index-embeddings-fastembed==0.5.0
+fastembed
 llama-index-embeddings-ollama
 
 # Caching & Performance
