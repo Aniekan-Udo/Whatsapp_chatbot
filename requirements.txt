@@ -73,7 +73,6 @@ pandas
 llama-index-core
 llama-index-vector-stores-postgres
 llama-index-embeddings-ollama
-llama-index-embeddings-fastembed
 cashews
 aiocache
 tenacity
