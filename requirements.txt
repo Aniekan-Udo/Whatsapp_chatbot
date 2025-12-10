@@ -2,10 +2,14 @@
 langchain-core
 langchain-community
 langgraph
+langgraph-checkpoint-postgres
+
 # LLM Providers
 langchain-groq
 
+# Web Framework
 fastapi
+uvicorn[standard]
 
 # Database
 asyncpg
@@ -17,7 +21,8 @@ alembic
 # Vector Store & Embeddings
 llama-index-core
 llama-index-vector-stores-postgres
-fastembed
+llama-index-embeddings-fastembed==0.5.0
+llama-index-embeddings-ollama
 
 # Caching & Performance
 cashews[redis]
@@ -34,48 +39,20 @@ tenacity
 
 # Logging & Monitoring
 structlog
+prometheus-client
 
-# Data Processing (optional, you have imports but may not use)
-pandas
-
-# Production Server (choose one)
-# Option 1: Uvicorn (recommended for single worker)
-uvicorn[standard]
-
-# Option 2: Gunicorn (for multiple workers)
-# gunicorn==23.0.0
-
-# Security (recommended additions)
-cryptography
-
-# Monitoring (recommended additions)
-# prometheus-client==0.21.0
-# sentry-sdk==2.19.2
-opentelemetry-instrumentation-fastapi
-opentelemetry-instrumentation-psycopg
+# OpenTelemetry
 opentelemetry-api
 opentelemetry-sdk
-opentelemetry-exporter-otlp-proto-grpc
-opentelemetry-exporter-prometheus
+opentelemetry-instrumentation-fastapi
 opentelemetry-instrumentation-asyncpg
 opentelemetry-instrumentation-sqlalchemy
-prometheus-client
-structlog
-asyncpg
-psycopg-pool
-langchain-core
-langchain-community
-langchain-groq
-langgraph
-langgraph-checkpoint-postgres
-pydantic
-trustcall
-sqlalchemy
+opentelemetry-instrumentation-psycopg
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-exporter-prometheus
+
+# Data Processing
 pandas
-llama-index-core
-llama-index-vector-stores-postgres
-llama-index-embeddings-ollama
-cashews
-aiocache
-tenacity
-python-dotenv
+
+# Security
+cryptography
