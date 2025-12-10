@@ -1,67 +1,84 @@
-fastapi
-uvicorn[standard]
-python-multipart
-langchain
+# Core Framework
+langchain-core
 langchain-community
-langchain-groq
-langchain-postgres
-langchain-huggingface
 langgraph
 langgraph-checkpoint-postgres
-psycopg[binary,pool]
-psycopg-pool
-asyncpg
-trustcall
-sentence-transformers
-pypdf
-python-docx
-docx2txt
-python-dotenv
-pydantic
-watchdog
-httpx
-pandas
-chromadb
-requests
-aiohttp
-sqlalchemy
-openai
+langgraph-store-postgres
 
-
-# Core
-fastapi
-uvicorn[standard]
-python-multipart
-pydantic
-pydantic-settings
+# LLM Providers
+langchain-groq
 
 # Database
 asyncpg
 psycopg[binary,pool]
 psycopg-pool
-sqlalchemy
+sqlalchemy[asyncio]
+alembic
 
-# LangChain & AI
-langchain
-langchain-community
-langchain-core
-langchain-postgres
-langchain-huggingface
-langchain-groq
-langchain-text-splitters
-langgraph
-langgraph-checkpoint
+# Vector Store & Embeddings
+llama-index-core
+llama-index-vector-stores-postgres
+llama-index-embeddings-fastembed
+fastembed
 
-# Embeddings & Vector Store
-sentence-transformers
-huggingface-hub
+# Caching & Performance
+cashews[redis]
+aiocache[redis]
+redis[asyncio]
+slowapi
 
-# Document Processing
-pypdf
-python-docx
-openpyxl
-httpx
-aiohttp
-requests
-tenacity
+# Utilities
+pydantic
+python-multipart
+python-dotenv
 trustcall
+tenacity
+
+# Logging & Monitoring
+structlog
+
+# Data Processing (optional, you have imports but may not use)
+pandas
+
+# Production Server (choose one)
+# Option 1: Uvicorn (recommended for single worker)
+uvicorn[standard]
+
+# Option 2: Gunicorn (for multiple workers)
+# gunicorn==23.0.0
+
+# Security (recommended additions)
+cryptography
+
+# Monitoring (recommended additions)
+# prometheus-client==0.21.0
+# sentry-sdk==2.19.2
+
+opentelemetry-instrumentation-psycopg
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-exporter-prometheus
+opentelemetry-instrumentation-asyncpg
+opentelemetry-instrumentation-sqlalchemy
+prometheus-client
+structlog
+asyncpg
+psycopg-pool
+langchain-core
+langchain-community
+langchain-groq
+langgraph
+langgraph-checkpoint-postgres
+pydantic
+trustcall
+sqlalchemy
+pandas
+llama-index-core
+llama-index-vector-stores-postgres
+llama-index-embeddings-ollama
+llama-index-embeddings-fastembed
+cashews
+aiocache
+tenacity
+python-dotenv

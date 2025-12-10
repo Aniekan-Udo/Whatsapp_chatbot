@@ -4,92 +4,260 @@ import asyncpg
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    # Also set it on the current running loop if one exists
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # No loop running yet, create one with the right policy
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
+from monitoring import setup_monitoring, monitor
+
 import uuid
-from typing import List, Optional, Literal, Dict, Any
-import asyncio
+from typing import List, Optional, Dict, Any
 import pandas as pd
-import httpx
 import os
 import json
-import hashlib
 import time
-import logging
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_postgres import PGVector
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, CSVLoader
-from langchain_core.messages import HumanMessage
-from langgraph.graph import MessagesState
-from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, Field
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.store.base import BaseStore
+from datetime import datetime
+
+# LangChain & LangGraph
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, merge_message_runs
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import tool
+from langgraph.graph import MessagesState
 from langgraph.graph import StateGraph, START, END, MessagesState
-from langgraph.types import interrupt
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.store.base import BaseStore
 
+# Document loaders
 from langchain_community.document_loaders import CSVLoader, WebBaseLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_postgres import PGVector
-from langchain_huggingface import HuggingFaceEmbeddings
 
+# Pydantic
+from pydantic import BaseModel, Field
+from pydantic import field_validator
+
+# TrustCall
 from trustcall import create_extractor
 from langchain_groq import ChatGroq
 
-from typing import List, Union, Optional
+# PostgreSQL
+
 from psycopg_pool import AsyncConnectionPool
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
+# SQLAlchemy
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base
+from sqlalchemy import Column, String, JSON, DateTime, Boolean, func, select
+
+
+from llama_index.core import (
+    VectorStoreIndex,
+    SimpleDirectoryReader,
+    StorageContext,
+    Settings
+)
+
 import os
-import logging
-import random
-from typing import List, Union, Optional
-from pydantic import BaseModel, Field
-from typing import Any, Callable, Tuple
-from functools import wraps
-from openai import OpenAI, APIError, RateLimitError, Timeout
-# Move these imports BEFORE get_pool() function
+from cashews import cache
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
+from llama_index.vector_stores.postgres import PGVectorStore
+from llama_index.core import SimpleDirectoryReader, StorageContext
+from llama_index.core import VectorStoreIndex
+from llama_index.vector_stores.postgres import PGVectorStore
+#from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+# Caching
+from aiocache import Cache
+from aiocache.serializers import PickleSerializer
+
+# Structured Logging
+import structlog
+from structlog.processors import JSONRenderer
+from sqlalchemy import text
+
+# Retry logic
 from tenacity import (
     retry, retry_if_exception_type, 
     stop_after_delay, stop_after_attempt,
     wait_combine, wait_exponential, wait_random
 )
-import requests
-import aiohttp, urllib3,openai,langchain_core
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# ============================================
+# CONFIGURATION
+# ============================================
+
 API_KEY = os.getenv("API_KEY")
-
 if not API_KEY:
-    raise ValueError("API_KEY not found in environment variables. Please check your .env file")
+    raise ValueError("API_KEY not found in environment variables")
 
-import uuid
-from langgraph.store.memory import InMemoryStore
-in_memory_store = InMemoryStore()
+POSTGRES_URI = os.getenv("POSTGRES_URI")
+POSTGRES_URI_POOLER = os.getenv("POSTGRES_URI_POOLER")
+if not POSTGRES_URI or not POSTGRES_URI_POOLER:
+    raise ValueError("POSTGRES_URI and POSTGRES_URI_POOLER must be set")
+
+# Don't add prepare_threshold to URI - it's not supported by psycopg_pool
+# We'll pass it via kwargs instead
+print(f"POSTGRES_URI: {POSTGRES_URI.split('@')[0]}@...")
+print(f"POSTGRES_URI_POOLER: {POSTGRES_URI_POOLER.split('@')[0]}@...")
+
+# ============================================
+# STRUCTURED LOGGING SETUP
+# ============================================
+
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        JSONRenderer()
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO level
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),
+)
+
+logger = structlog.get_logger()
+
+# ============================================
+# LLAMAINDEX CONFIGURATION
+# ============================================
+from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.embeddings.fastembed import FastEmbedEmbedding
+from llama_index.core import Settings
+from cashews import CircuitBreakerOpen, RateLimitError, cache
+
+Settings.embed_model = FastEmbedEmbedding(
+    model_name="BAAI/bge-small-en-v1.5",
+    max_length=512
+)
+
+
+# ============================================
+# GROQ MODEL
+# ============================================
 
 try:
     model = ChatGroq(model="llama-3.3-70b-versatile", api_key=API_KEY)
 except Exception as e:
-    raise ValueError(f"Failed to initialize ChatGroq model. Check your API key: {e}")
+    raise ValueError(f"Failed to initialize ChatGroq model: {e}")
+
+# ============================================
+# COMPLETE SQLAlchemy Setup - Replace in bot.py
+# ============================================
+
+# Use psycopg
+async_uri = POSTGRES_URI.replace('postgresql://', 'postgresql+psycopg://')
+
+if 'sslmode' not in async_uri:
+    separator = '&' if '?' in async_uri else '?'
+    async_uri += f'{separator}sslmode=require'
+
+engine = create_async_engine(
+    async_uri,
+    pool_pre_ping=True,
+    pool_recycle=300,
+    pool_size=5,
+    max_overflow=10,
+    echo=False,
+    connect_args={
+        "prepare_threshold": 0,  
+        "autocommit": True,      
+    }
+)
+
+#Session factory for database operations
+async_session_factory = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False
+)
+
+print(f"✅ SQLAlchemy engine created with prepare_threshold=0")
+
+# ============================================
+# DATABASE MODELS
+# ============================================
+Base = declarative_base()
+class UserProfile(Base):
+    __tablename__ = 'user_profiles'
+    
+    business_id = Column(String, primary_key=True)
+    user_id = Column(String, primary_key=True)
+    name = Column(String, nullable=True)
+    location = Column(String, nullable=True)
+    address = Column(String, nullable=True)
+    cart = Column(JSON, nullable=True)
+    human_active = Column(Boolean, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+class BusinessDocument(Base):
+    __tablename__ = 'business_documents'
+    
+    business_id = Column(String, primary_key=True)
+    document_path = Column(String, nullable=False)
+    document_name = Column(String)
+    document_type = Column(String)
+    status = Column(String, default='active')
+    doc_metadata = Column('metadata', JSON)
+    uploaded_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+# ============================================
+# PYDANTIC MODELS
+# ============================================
+
+class Profile(BaseModel):
+    """User profile information for personalizing customer service."""
+    name: Optional[str] = Field(default=None, description="Customer's name")
+    location: Optional[str] = Field(default=None, description="Customer's location")
+    address: Optional[str] = Field(default=None, description="Customer's delivery address")
+    cart: Optional[List[str]] = Field(default=None, description="Items in cart")
+    human_active: Optional[bool] = Field(default=None, description="Human agent active")
+
+class CartItem(BaseModel):
+    """Cart item with quantity support"""
+    item: str = Field(description="Name of the product/item")
+    quantity: int = Field(default=1, ge=1, le=99, description="Quantity (1-99)")
+
+class CustomerAction(BaseModel):
+    """Handle customer requests with multiple actions."""
+    update_profile: bool = Field(default=False, description="Save profile info")
+    search_menu: bool = Field(default=False, description="Search menu items")
+    search_query: Optional[str] = Field(default=None, description="Search query")
+    add_to_cart: bool = Field(default=False, description="Add items to cart")
+    cart_items: Optional[List[CartItem]] = Field(default=None, description="Items to add")
+    remove_from_cart: bool = Field(default=False, description="Remove items")
+    items_to_remove: Optional[List[CartItem]] = Field(default=None, description="Items to remove")
+    view_cart: bool = Field(default=False, description="View cart")
+    ready_to_order: bool = Field(default=False, description="Ready to order")
+    ready_to_pay: bool = Field(default=False, description="Ready to pay")
 
 
+    @field_validator('search_query')
+    @classmethod
+    def validate_search_query(cls, v):
+        if v and len(v) > 500:
+            raise ValueError("Search query too long (max 500 chars)")
+        return v
+    
+    @field_validator('cart_items')
+    @classmethod
+    def validate_cart_items(cls, v):
+        if v and len(v) > 50:
+            raise ValueError("Too many items in single request (max 50)")
+        return v
 
-MSG_PROMPT= """
+# ============================================
+# PROMPTS
+# ============================================
+
+MSG_PROMPT = """
 You are a whatsapp assistant, your duty is to assist business owners attend to customers.
 
 Your primary responsibilities:
@@ -115,509 +283,227 @@ CURRENT USER INFORMATION:
 
 INSTRUCTIONS:
 1. Review the chat history below carefully
-2. Identify new information about the user, such as:
-   - Personal details (name, address, location, cart)
-   - Preferences (likes, dislikes)
-   - Interests and hobbies
-   - Past experiences
-   - Goals or future plans
-   - Delivery address
-   - Ordered items
+2. Identify new information about the user
 3. Merge any new information with existing memory
 4. Format the memory as a clear, structured profile
-5. If new information conflicts with existing memory, keep the most recent version
 
 CRITICAL: 
 - Use null (not the string "None") for fields with no information
 - Only include factual information directly stated by the user
-- Do not make assumptions or inferences
-- Leave fields as null if not mentioned in the conversation
 
 Based on the chat history below, please update the user information:"""
 
-class Profile(BaseModel):
-    """User profile information for personalizing customer service.
-    
-    IMPORTANT: Use null for unknown fields, not the string "None".
-    Only populate fields with actual information from the conversation.
-    """
-    
-    name: Optional[str] = Field(
-        default=None, 
-        description="Customer's name. Use null if not mentioned."
-    )
-    location: Optional[str] = Field(
-        default=None, 
-        description="Customer's general location or city. Use null if not mentioned."
-    )
-    address: Optional[str] = Field(
-        default=None, 
-        description="Customer's full delivery address. Use null if not mentioned."
-    )
-    cart: Optional[List[str]] = Field(
-        default=None, 
-        description="List of items in customer's order. Use null if no items ordered yet."
-    )
-    
-    human_active: Optional[bool] = Field(
-        default=None, 
-        description="Whether a human agent is currently handling this customer. Use null if unknown."
-    )
+# ============================================
+# PROFILE EXTRACTOR
+# ============================================
 
-
-class BusinessDocument(BaseModel):
-    """Business document configuration - Only for business owners/admins."""
-    
-    business_id: str = Field(description="Unique business identifier (admin only)")
-    document_path: str = Field(description="Local or S3 path to document (admin only)")
-    document_name: Optional[str] = Field(
-        default=None, 
-        description="Friendly name for the document"
-    )
-    document_type: Optional[str] = Field(
-        default=None, 
-        description="Document type (csv, pdf, docx, etc.)"
-    )
-    status: str = Field(
-        default='active', 
-        description="Document status (active/inactive)"
-    )
-    metadata: Optional[dict] = Field(
-        default=None, 
-        description="Additional metadata (S3 URI, version, etc.)"
-    )
-
-
-# -----------------------------
-# Profile extractor
-# -----------------------------
 profile_extractor = create_extractor(
     model,
     tools=[Profile],
     tool_choice="Profile",
 )
 
-
-
-class CartItem(BaseModel):
-    """Cart item with quantity support"""
-    item: str = Field(description="Name of the product/item")
-    quantity: int = Field(
-        default=1, 
-        ge=1, 
-        le=99, 
-        description="Quantity to add (1-99, default: 1)"
-    )
-
-
-class CustomerAction(BaseModel):
-    """Handle customer requests which may include multiple actions.
-    
-    This tool should be called whenever the customer:
-    - Shares personal information (name, address, preferences)
-    - Asks about menu items or availability
-    - Wants to add/remove items from cart
-    - Wants to place an order
-    """
-    
-    update_profile: bool = Field(
-        default=False,
-        description="True if message contains profile information to save (name, location, address, preferences) - NOT for cart items"
-    )
-    
-    search_menu: bool = Field(
-        default=False,
-        description="True if customer is asking about menu items, prices, or availability without wanting to order yet"
-    )
-    
-    search_query: Optional[str] = Field(
-        default=None,
-        description="The specific menu item, category, or question they're asking about"
-    )
-    
-    add_to_cart: bool = Field(
-        default=False,
-        description="True if customer wants to add item(s) to their cart or order something"
-    )
-    
-
-    cart_items: Optional[List[CartItem]] = Field(
-        default=None,
-        description=(
-            "List of items to add to cart with quantities. "
-            "Each item should have 'item' (name) and 'quantity' (number). "
-            "Example: [{'item': 'Burger', 'quantity': 2}, {'item': 'Fries', 'quantity': 1}]"
-        )
-    )
-    
-    remove_from_cart: bool = Field(
-        default=False,
-        description="True if customer wants to remove item(s) from cart"
-    )
-    
-    # Use List[CartItem] instead of Union
-    items_to_remove: Optional[List[CartItem]] = Field(
-        default=None,
-        description=(
-            "Items to remove from cart with quantities. "
-            "Each item should have 'item' (name) and 'quantity' (number to remove). "
-            "Example: [{'item': 'Burger', 'quantity': 1}]"
-        )
-    )
-    
-    view_cart: bool = Field(
-        default=False,
-        description="True if customer wants to see what's in their cart"
-    )
-    
-    ready_to_order: bool = Field(
-        default=False,
-        description="True if customer is ready to place/finalize their order"
-    )
-
-    ready_to_pay: bool = Field(
-        default=False,
-        description="True if customer is ready to pay for their order"
-    )
-
-
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-
-MAX_MEMORY_MESSAGES = 100
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
-
+# ============================================
+# EXCEPTION HANDLING
+# ============================================
 
 WHATSAPP_CHATBOT_EXCEPTIONS = (
-    # === NETWORK / HTTP ERRORS ===
     ConnectionError,
-    requests.exceptions.RequestException,  # WhatsApp API calls
-    aiohttp.ClientError,                   # Async HTTP (if using aiohttp)
-    urllib3.exceptions.NewConnectionError,
-    httpx.ConnectError, httpx.TimeoutException,  # If using httpx
-    
-    # === DATABASE ERRORS ===
-    asyncpg.PostgresError,               # All Postgres errors
+    asyncpg.PostgresError,
     asyncpg.InterfaceError,
-    asyncpg.InternalServerError,
-    
-    
-    # === VECTOR STORE / RAG ERRORS ===
-    TimeoutError,                        # Embedding timeouts
-    ValueError,                          # Invalid embeddings/vectors
-    IndexError,                        # Vector index issues
+    TimeoutError,
+    ValueError,
+    IndexError,
     json.JSONDecodeError,
-
-
-    # ==== API ERROR ===
-    APIError,
-    RateLimitError,
-    
-    
-    # === EMBEDDING MODEL ERRORS ===
-    openai.APIError, openai.RateLimitError, openai.APIConnectionError,  
-    
-    # === SYSTEM / FILE ERRORS ===
     OSError,
     FileNotFoundError,
-    PermissionError,
-    
-    
 )
 
-# Use DIRECT connection for LangGraph (checkpointer/store)
-POSTGRES_URI = os.getenv("POSTGRES_URI")
-# Use POOLER connection for PGVector
-POSTGRES_URI_POOLER = os.getenv("POSTGRES_URI_POOLER")
+# ============================================
+# LOCK MANAGEMENT
+# ============================================
 
-if not POSTGRES_URI:
-    raise ValueError("POSTGRES_URI not set")
-if not POSTGRES_URI_POOLER:
-    raise ValueError("POSTGRES_URI_POOLER not set")
+_init_locks: Dict[str, asyncio.Lock] = {}
+_locks_lock = asyncio.Lock()
 
-# FIND THIS SECTION IN bot.py (around line 320-350) AND REPLACE IT:
+async def get_init_lock(business_id):
+    """Get or create a lock for a business ID."""
+    async with _locks_lock:
+        if business_id not in _init_locks:
+            _init_locks[business_id] = asyncio.Lock()
+            
+            # Cleanup old locks
+            if len(_init_locks) > 1000:
+                to_remove = list(_init_locks.keys())[:100]
+                for key in to_remove:
+                    del _init_locks[key]
+        
+        return _init_locks[business_id]
 
-@retry(
-    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
-    stop=(stop_after_delay(30) | stop_after_attempt(5)),
-    wait=wait_combine(
-        wait_exponential(multiplier=1, max=10),
-        wait_random(min=0, max=2)
-    )
-)
+# ============================================
+# DATABASE SETUP
+# ============================================
+
+store = None
+saver = None
+_pool: AsyncConnectionPool = None
+
+
+
+# ============================================
+# GET_POOL FUNCTION
+# ============================================
+
+@monitor(operation="get_pool")
 async def get_pool() -> AsyncConnectionPool:
-    """Get or create the database connection pool with retry logic."""
+    """Get or create database connection pool."""
     global _pool
     
-    if _pool is None:
-        logger.info("📦 Creating database connection pool...")
+    if _pool is None or _pool.closed:
+        logger.info("pool_creation_started")
         
-        clean_uri = POSTGRES_URI.split('?')[0]
+        # ✅ Remove prepare_threshold from URI if present
+        clean_uri = POSTGRES_URI
+        if 'prepare_threshold' in clean_uri:
+            clean_uri = clean_uri.replace('&prepare_threshold=0', '').replace('?prepare_threshold=0', '')
         
-        try:
-            _pool = AsyncConnectionPool(
-                conninfo=clean_uri,
-                min_size=1,
-                max_size=10,
-                open=False,
-                timeout=30,
-                max_waiting=5,
-                max_lifetime=1800,  # ✅ 30 minutes - connections recycled before timeout
-                max_idle=300,       # ✅ 5 minutes - close idle connections
-                # 🔥 ADD THESE NEW PARAMETERS:
-                reconnect_timeout=60.0,  # Retry reconnection for 60 seconds
-                num_workers=3,           # Use connection pool workers
-            )
-            
-            await _pool.open(wait=True, timeout=30)
-            
-            # Test connection
-            async with _pool.connection() as conn:
-                result = await conn.execute("SELECT 1")
-                await result.fetchone()
-            
-            logger.info("✅ Database pool connected!")
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to create pool: {e}")
-            _pool = None
-            raise Exception(f"Database connection failed: {e}")
-    
-    # 🔥 ADD THIS: Check if pool is healthy, recreate if needed
-    try:
-        if _pool and _pool.closed:
-            logger.warning("Pool was closed, recreating...")
-            _pool = None
-            return await get_pool()  # Recursive call to recreate
-    except Exception as e:
-        logger.warning(f"Pool health check failed: {e}")
-        _pool = None
-        return await get_pool()
+        logger.info("creating_pool", uri_preview=clean_uri.split('@')[0])
+        
+        # ✅ Pass prepare_threshold via kwargs parameter
+        _pool = AsyncConnectionPool(
+            conninfo=clean_uri,
+            min_size=2,
+            max_size=10,
+            max_waiting=20,
+            timeout=20,
+            max_lifetime=600,
+            max_idle=120,
+            reconnect_timeout=5.0,
+            num_workers=2,
+            kwargs={
+                "prepare_threshold": 0  # ✅ Disable prepared statements here
+            }
+        )
+        
+        await asyncio.wait_for(_pool.open(wait=True), timeout=20.0)
+        
+        # Test pool with cursor (not fetchval)
+        async with _pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT 1")
+                result = await cur.fetchone()
+                logger.info("pool_test_successful", result=result[0])
+        
+        logger.info("pool_created_successfully")
     
     return _pool
 
 
-async def ensure_pool_health():
-    """Ensure the connection pool is healthy before use."""
+
+import signal
+@monitor(operation="shutdown")
+async def shutdown(signal_received):
+    """Cleanup on shutdown."""
+    logger.info("shutdown_initiated", signal=signal_received)
+    
+    # Close connection pools
     global _pool
+    if _pool:
+        await _pool.close()
     
-    if _pool is None:
-        return await get_pool()
+    # Close SQLAlchemy engine
+    await engine.dispose()
     
-    try:
-        # Quick health check
-        async with _pool.connection() as conn:
-            await conn.execute("SELECT 1")
-        return _pool
-    except Exception as e:
-        logger.warning(f"Pool unhealthy, recreating: {e}")
-        try:
-            await _pool.close()
-        except:
-            pass
-        _pool = None
-        return await get_pool()
+    logger.info("shutdown_complete")
 
+# Register signal handlers
+for sig in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(sig, lambda s, f: asyncio.create_task(shutdown(s)))
 
-_init_locks: Dict[str, asyncio.Lock]={}
-_locks_lock=asyncio.Lock()
-
-async def get_init_lock(business_id):
-    """Get or create a lock for a particular business ID.
-    
-    Prevents thundering herd scenario during RAG initialization.
-    """
-    async with _locks_lock:
-        if business_id not in _init_locks:
-            _init_locks[business_id] = asyncio.Lock()
-
-            # Simple cleanup: remove oldest locks if cache grows too large
-            if len(_init_locks) > 1000:
-                # Remove first 100 locks
-                to_remove = list(_init_locks.keys())[:100]
-                for key in to_remove:
-                    del _init_locks[key]
-
-        return _init_locks[business_id]
-    
-store = None
-saver = None
-
-
-# -----------------------------
-# Connect to DB
-# -----------------------------
-
-_pool: AsyncConnectionPool = None
-
-async def drop_old_tables_once():
-    """Drop old tables - run once then comment out"""
-    import asyncpg
-    
-    print("Dropping old tables...")
-    clean_uri = POSTGRES_URI.split('?')[0]
-    conn = await asyncpg.connect(clean_uri, timeout=30)
-    
-    try:
-        await conn.execute("DROP TABLE IF EXISTS store CASCADE;")
-        await conn.execute("DROP TABLE IF EXISTS checkpoints CASCADE;")
-        await conn.execute("DROP TABLE IF EXISTS writes CASCADE;")
-        print("Old tables dropped")
-    finally:
-        await conn.close()
-
-async def create_tables_manually():
-    """Create tables using the connection pool instead of direct connection"""
-    print("Creating tables manually via connection pool...")
-    
-    pool = await ensure_pool_health()
-    
-    async with pool.connection() as conn:
-        # Create store table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS store (
-                prefix TEXT NOT NULL,
-                key TEXT NOT NULL,
-                value JSONB NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                ttl_minutes INTEGER,
-                expires_at TIMESTAMP WITH TIME ZONE,
-                PRIMARY KEY (prefix, key)
-            );
-        """)
-        
-        # Create indexes
-        await conn.execute("CREATE INDEX IF NOT EXISTS store_prefix_key_idx ON store(prefix, key);")
-        await conn.execute("CREATE INDEX IF NOT EXISTS store_prefix_idx ON store(prefix);")
-        await conn.execute("CREATE INDEX IF NOT EXISTS store_expires_at_idx ON store(expires_at) WHERE expires_at IS NOT NULL;")
-        print("Store table created")
-        
-        # Create checkpoints table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS checkpoints (
-                thread_id TEXT NOT NULL,
-                checkpoint_ns TEXT NOT NULL DEFAULT '',
-                checkpoint_id TEXT NOT NULL,
-                parent_checkpoint_id TEXT,
-                type TEXT,
-                checkpoint JSONB NOT NULL,
-                metadata JSONB NOT NULL DEFAULT '{}',
-                PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
-            );
-        """)
-        
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS checkpoints_thread_id_checkpoint_ns_idx 
-            ON checkpoints(thread_id, checkpoint_ns);
-        """)
-        print("Checkpoints table created")
-        
-        # Create writes table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS writes (
-                thread_id TEXT NOT NULL,
-                checkpoint_ns TEXT NOT NULL DEFAULT '',
-                checkpoint_id TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                idx INTEGER NOT NULL,
-                channel TEXT NOT NULL,
-                type TEXT,
-                value JSONB,
-                PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
-            );
-        """)
-        
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS writes_thread_id_checkpoint_ns_checkpoint_id_idx 
-            ON writes(thread_id, checkpoint_ns, checkpoint_id);
-        """)
-        print("Writes table created")
-
-
-
-import asyncpg
-# Global session maker
-async_session_maker = None
-
-@retry(
-    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
-    stop=(stop_after_delay(15) | stop_after_attempt(3)),  # ✅ Reduced from 30s/5 attempts
-    wait=wait_combine(
-        wait_exponential(multiplier=1, max=5),  # ✅ Reduced from max=10
-        wait_random(min=0, max=1)  # ✅ Reduced from max=2
-    )
-)
+@monitor(operation="setup_database")
 async def setup_database():
     """Setup database tables and return store and saver instances."""
     global store, saver
     
-    logger.info("=== SETUP_DATABASE CALLED ===")
+    logger.info("database_setup_started")
     
     try:
-        pool = await ensure_pool_health()
+        # Create SQLAlchemy tables
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
         
-        # Create required tables
+        logger.info("sqlalchemy_tables_created")
+        
+        # Get connection pool for LangGraph
+        pool = await get_pool()
+        
+        # Create LangGraph tables
         async with pool.connection() as conn:
-            # Create user_profiles table
+            # Store table
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS user_profiles (
-                    business_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    name TEXT,
-                    location TEXT,
-                    address TEXT,
-                    cart JSONB,
-                    human_active BOOLEAN,
+                CREATE TABLE IF NOT EXISTS store (
+                    prefix TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value JSONB NOT NULL,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (business_id, user_id)
+                    PRIMARY KEY (prefix, key)
                 );
             """)
-            logger.info("✓ user_profiles table created/verified")
             
-            # Create business_documents table
+            await conn.execute("CREATE INDEX IF NOT EXISTS store_prefix_idx ON store(prefix);")
+            
+            # Checkpoints table
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS business_documents (
-                    business_id TEXT PRIMARY KEY,
-                    document_path TEXT NOT NULL,
-                    document_name TEXT,
-                    document_type TEXT,
-                    status TEXT DEFAULT 'active',
-                    metadata JSONB,
-                    uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    thread_id TEXT NOT NULL,
+                    checkpoint_ns TEXT NOT NULL DEFAULT '',
+                    checkpoint_id TEXT NOT NULL,
+                    parent_checkpoint_id TEXT,
+                    type TEXT,
+                    checkpoint JSONB NOT NULL,
+                    metadata JSONB NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
                 );
             """)
-            logger.info("✓ business_documents table created/verified")
             
-            # Create indexes
+            # Writes table
             await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_user_profiles_business 
-                ON user_profiles(business_id);
+                CREATE TABLE IF NOT EXISTS writes (
+                    thread_id TEXT NOT NULL,
+                    checkpoint_ns TEXT NOT NULL DEFAULT '',
+                    checkpoint_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    idx INTEGER NOT NULL,
+                    channel TEXT NOT NULL,
+                    type TEXT,
+                    value JSONB,
+                    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
+                );
             """)
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_business_documents_status 
-                ON business_documents(status) WHERE status = 'active';
-            """)
-            logger.info("✓ Indexes created/verified")
         
-        # Create store and saver
+        logger.info("langgraph_tables_created")
+        
+        # Initialize store and saver
         store = AsyncPostgresStore(pool)
         saver = AsyncPostgresSaver(pool)
         
-        # Setup store and saver (creates their tables)
         await store.setup()
         await saver.setup()
         
-        logger.info("=== DATABASE READY ===")
+        logger.info("database_setup_completed")
         return store, saver
         
     except Exception as e:
-        logger.error(f"❌ Database setup failed: {e}", exc_info=True)
+        logger.error("database_setup_failed", error=str(e))
         raise
 
+# ============================================
+# BUSINESS DOCUMENT MANAGEMENT
+# ============================================
+
+
+@monitor(operation="register_document")
 async def register_business_document(
     business_id: str, 
     document_path: str, 
@@ -626,172 +512,327 @@ async def register_business_document(
     metadata: dict = None
 ):
     """Register a document for a business."""
-    
-    # Validate file exists (skip for S3 URIs)
     if not document_path.startswith('s3://') and not os.path.exists(document_path):
         raise FileNotFoundError(f"Document not found: {document_path}")
     
-    # Auto-detect
     if not document_type:
         document_type = os.path.splitext(document_path)[1].replace('.', '').lower()
     if not document_name:
         document_name = os.path.basename(document_path)
     
-    # Create Pydantic model for validation
-    doc = BusinessDocument(
-        business_id=business_id,
-        document_path=document_path,
-        document_name=document_name,
-        document_type=document_type,
-        metadata=metadata
-    )
-    
-    pool = await ensure_pool_health()
-    
-    async with pool.connection() as conn:
-        await conn.execute(
-            """
-            INSERT INTO business_documents (business_id, document_path, document_name, document_type, metadata, updated_at)
-            VALUES (%s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (business_id) DO UPDATE SET
-                document_path = EXCLUDED.document_path,
-                document_name = EXCLUDED.document_name,
-                document_type = EXCLUDED.document_type,
-                metadata = EXCLUDED.metadata,
-                updated_at = NOW()
-            """,
-            (
-                doc.business_id,
-                doc.document_path,
-                doc.document_name,
-                doc.document_type,
-                json.dumps(doc.metadata) if doc.metadata else None
-            )
+    async with async_session_factory() as session:
+        doc = BusinessDocument(
+            business_id=business_id,
+            document_path=document_path,
+            document_name=document_name,
+            document_type=document_type,
+            metadata=metadata,
+            status='active'
         )
+        
+        await session.merge(doc)
+        await session.commit()
     
-    print(f"✓ Document registered for business {business_id}: {document_name}")
+    logger.info("document_registered", business_id=business_id, document_name=document_name)
 
-
+@monitor(operation="get_document")
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=5),
+    retry=retry_if_exception_type((
+        asyncpg.PostgresError,
+        asyncpg.InterfaceError,
+        ConnectionError,
+    )),
+    reraise=True
+)
 async def get_business_document(business_id: str) -> Optional[str]:
     """Get the document path for a business."""
-    pool = await ensure_pool_health()
-    
-    async with pool.connection() as conn:
-        result = await conn.execute(
-            """
-            SELECT document_path, document_name, status 
-            FROM business_documents 
-            WHERE business_id = %s AND status = 'active'
-            """,
-            (business_id,)
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(BusinessDocument).where(
+                BusinessDocument.business_id == business_id,
+                BusinessDocument.status == 'active'
+            )
         )
-        row = await result.fetchone()
+        doc = result.scalar_one_or_none()
         
-        if row:
-            doc_path, doc_name, status = row
-            print(f"✓ Found document for business {business_id}: {doc_name}")
-            
-            # Validate file still exists (skip for S3 URIs)
-            if not doc_path.startswith('s3://') and not os.path.exists(doc_path):
-                print(f"WARNING: Document path no longer exists: {doc_path}")
+        if doc:
+            if not doc.document_path.startswith('s3://') and not os.path.exists(doc.document_path):
+                logger.warning("document_path_missing", business_id=business_id, path=doc.document_path)
                 return None
             
-            return doc_path
+            logger.info("document_found", business_id=business_id, document_name=doc.document_name)
+            return doc.document_path
         
         return None
 
-
-async def list_business_documents() -> list[BusinessDocument]:
-    """List all registered business documents."""
-    pool = await ensure_pool_health()
+# ============================================
+# RAG WITH LLAMAINDEX
+# ============================================
+@monitor(operation="create_metadata_indexes")
+async def create_metadata_indexes(business_id: str):
+    """
+    Create metadata indexes for efficient filtering.
+    LlamaIndex handles vector indexes automatically.
+    """
+    # ✅ FIX: LlamaIndex prefixes with "data_" - match exactly
+    table_name = f"data_business_{business_id}_menu"
     
-    async with pool.connection() as conn:
-        result = await conn.execute(
-            """
-            SELECT business_id, document_path, document_name, document_type, status, metadata
-            FROM business_documents
-            ORDER BY uploaded_at DESC
-            """
-        )
-        rows = await result.fetchall()
+    try:
+        async with engine.begin() as conn:
+            # Check if table exists first
+            table_exists = await conn.execute(text(f"""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = '{table_name}'
+                )
+            """))
+            exists = (await table_exists.fetchone())[0]
+            
+            if not exists:
+                logger.warning("table_not_found", 
+                             business_id=business_id,
+                             table_name=table_name)
+                return
+            
+            # Create indexes WITHOUT CONCURRENTLY (causes issues in transactions)
+            await conn.execute(text(f"""
+                CREATE INDEX IF NOT EXISTS idx_{table_name}_category 
+                ON {table_name} 
+                USING gin ((metadata_->>'category'))
+            """))
+            
+            await conn.execute(text(f"""
+                CREATE INDEX IF NOT EXISTS idx_{table_name}_available 
+                ON {table_name} 
+                USING btree ((metadata_->>'available'))
+            """))
+            
+            await conn.execute(text(f"""
+                CREATE INDEX IF NOT EXISTS idx_{table_name}_price 
+                ON {table_name} 
+                USING btree (((metadata_->>'price')::numeric))
+            """))
         
-        return [
-            BusinessDocument(
-                business_id=row[0],
-                document_path=row[1],
-                document_name=row[2],
-                document_type=row[3],
-                status=row[4],
-                metadata=json.loads(row[5]) if row[5] else None
-            )
-            for row in rows
-        ]
+        logger.info("metadata_indexes_created", 
+                    business_id=business_id,
+                    table_name=table_name)
+                    
+    except Exception as e:
+        logger.error("metadata_index_creation_failed",
+                    business_id=business_id,
+                    error=str(e))
+        
 
+# ============================================
+# SETUP (1 LINE)
+# ============================================
+cache.setup("mem://")  # Use in-memory cache
+logger.info("cache_initialized", backend="memory")
 
-async def deactivate_business_document(business_id: str):
-    """Deactivate a business document (soft delete)."""
-    pool = await ensure_pool_health()
-    
-    async with pool.connection() as conn:
-        await conn.execute(
-            """
-            UPDATE business_documents
-            SET status = 'inactive', updated_at = NOW()
-            WHERE business_id = %s
-            """,
-            (business_id,)
-        )
-    
-    print(f"Document deactivated for business {business_id}")
-
-@retry(
-    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
-    stop=(stop_after_delay(30) | stop_after_attempt(5)),
-    wait=wait_combine(
-        wait_exponential(multiplier=1, max=10),
-        wait_random(min=0, max=2)
-    )
+# ============================================
+# YOUR FUNCTION (JUST BUSINESS LOGIC)
+# ============================================
+@cache(
+    ttl="30m",
+    key="rag:{business_id}",
+    lock=True
 )
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type((
+        asyncpg.PostgresError,
+        asyncpg.InterfaceError,
+        ConnectionError,
+        TimeoutError,
+        FileNotFoundError,
+    )),
+    reraise=True
+)
+@monitor(operation="rag_init")
+async def initialize_rag(business_id: str = None, doc_path: str = None, doc_paths: List = None):
+    """Initialize RAG and return config."""
+    
+    if not business_id:
+        raise ValueError("business_id is required")
+    
+    collection_name = f"business_{business_id}_menu"
+    
+    # Check if already initialized (table exists)
+    try:
+        vector_store = PGVectorStore.from_params(
+            connection_string=POSTGRES_URI_POOLER,
+            table_name=collection_name,
+            embed_dim=384,
+            hybrid_search=False,
+            perform_setup=False,  # Don't create if checking
+        )
+        # Try a simple query to verify table exists and has data
+        index = VectorStoreIndex.from_vector_store(vector_store)
+        
+        logger.info("rag_already_initialized", business_id=business_id)
+        return {"collection_name": collection_name}
+        
+    except Exception:
+        # Table doesn't exist or is empty, do full initialization
+        logger.info("rag_initialization_started", business_id=business_id)
+    
+    # Get documents
+    if doc_path and not doc_paths:
+        doc_paths = [doc_path]
+    if not doc_paths:
+        doc_paths = await get_business_document(business_id)
+        if not doc_paths:
+            raise ValueError(f"No document for business '{business_id}'")
+        doc_paths = [doc_paths] if isinstance(doc_paths, str) else doc_paths
+    
+    # Validate files
+    for path in doc_paths:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Document not found: {path}")
+    
+    # Load documents
+    documents = SimpleDirectoryReader(input_files=doc_paths).load_data()
+    if not documents:
+        raise ValueError(f"No documents loaded from {doc_paths}")
+    
+    logger.info("documents_loaded", business_id=business_id, count=len(documents))
+    
+    # Create vector store and index
+    vector_store = PGVectorStore.from_params(
+        connection_string=POSTGRES_URI,
+        table_name=collection_name,
+        embed_dim=384,
+        hybrid_search=False,
+        perform_setup=True,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+    )
+    
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    
+    VectorStoreIndex.from_documents(
+        documents,
+        storage_context=storage_context,
+        show_progress=True
+    )
+    
+    # Create metadata indexes
+    try:
+        await create_metadata_indexes(business_id)
+    except Exception as idx_error:
+        logger.warning("metadata_index_creation_skipped", 
+                     business_id=business_id, 
+                     error=str(idx_error))
+    
+    logger.info("rag_initialized", business_id=business_id)
+    
+    return {"collection_name": collection_name}
+            
+
+# ============================================
+# LANGGRAPH NODES
+# ============================================
+
+@cache.circuit_breaker(
+    errors_rate=10,
+    period="10m",
+    ttl="5m",
+    min_calls=5
+)
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),  # Exponential backoff
+    retry=retry_if_exception_type((
+        ConnectionError,
+        TimeoutError,
+        asyncio.TimeoutError,
+    )),  # Only retry transient errors
+    reraise=True
+)
+@cache(ttl="2m")
+@monitor(model="llama-3.3-70b", track_tokens=True)
+async def call_groq_api(messages: list, tools: list = None):
+    """
+    EXTERNAL API - NEEDS RETRY + CIRCUIT BREAKER
+    
+    Why retry?
+    - Network hiccups (transient)
+    - Temporary rate limits
+    - API momentary unavailability
+    
+    Why circuit breaker?
+    - Stop retrying if service is down (not transient)
+    - Fail fast after threshold reached
+    """
+    try:
+        logger.info("groq_api_call_started")
+        
+        if tools:
+            response = await model.bind_tools(tools).ainvoke(messages)
+        else:
+            response = await model.ainvoke(messages)
+        
+        logger.info("groq_api_call_success")
+        return response
+        
+    except Exception as e:
+        logger.error("groq_api_call_failed", error=str(e), error_type=type(e).__name__)
+        raise
+
+@monitor(operation="chatbot")
 async def chatbot(state: MessagesState, config: RunnableConfig):
-    """Load memory from the store and use it to personalize the chatbot's response."""
+    """
+    🟡 Use circuit-breaker-protected API call.
+    """
     global store
-    # Get the user ID from the config
+    
     user_id = config["configurable"]["user_id"]
     business_id = config["configurable"]["business_id"]
-
-    # Consistent namespace order
+    
     namespace = ("profile", business_id, user_id)
     key = "user_memory"
     existing_memory = await store.aget(namespace, key)
-
-
-    # Extract the actual memory content if it exists
+    
     if existing_memory:
         existing_memory_content = existing_memory.value.get('memory')
     else:
         existing_memory_content = "No existing memory found."
-
-    # Format the memory in the system prompt
+    
     system_msg = MSG_PROMPT.format(user_profile=existing_memory_content)
     
-    # FIXED: Pass both system message AND conversation history
-    response = await model.bind_tools([CustomerAction]).ainvoke(
-        [SystemMessage(content=system_msg)] + state["messages"]
-    )
-    
-    return {"messages": [response]}
+    try:
+        #
+        response = await call_groq_api(
+            [SystemMessage(content=system_msg)] + state["messages"],
+            tools=[CustomerAction]
+        )
+        return {"messages": [response]}
+        
+    except CircuitBreakerOpen:
+        logger.warning("circuit_breaker_open", business_id=business_id)
+        # Return fallback response
+        return {
+            "messages": [AIMessage(content="I'm experiencing high traffic right now. Please try again in a moment.")]
+        }
 
-@retry(
-    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
-    stop=(stop_after_delay(30) | stop_after_attempt(5)),
-    wait=wait_combine(
-        wait_exponential(multiplier=1, max=10),
-        wait_random(min=0, max=2)
-    )
-)
+@monitor(operation="write_memory")       
 async def write_memory(state: MessagesState, config: RunnableConfig):
-    """Extract and save profile information."""
+    """
+    PROFILE UPDATE - SELECTIVE RETRY
+    
+    Retry strategy:
+    - DON'T retry API call (handled by circuit breaker)
+    - DO retry database save (transient errors)
+    """
     global store
+    
     user_id = config["configurable"]["user_id"]
     business_id = config["configurable"]["business_id"]
     
@@ -814,62 +855,73 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
         [SystemMessage(content=TRUSTCALL_INSTRUCTION_FORMATTED)] + conversation_history
     ))
     
-    result = await profile_extractor.ainvoke({
-        "messages": updated_messages,
-        "existing": existing_memories
-    })
+    try:
+        # 🔵 API call - circuit breaker handles retries internally
+        result = await profile_extractor.ainvoke({
+            "messages": updated_messages,
+            "existing": existing_memories
+        })
+        
+    except CircuitBreakerOpen:
+        logger.warning("profile_extraction_circuit_open", business_id=business_id)
+        tool_calls = state['messages'][-1].tool_calls
+        return {
+            "messages": [{
+                "role": "tool",
+                "content": "Profile update temporarily unavailable. Your information will be saved on the next interaction.",
+                "tool_call_id": tool_calls[0]['id']
+            }]
+        }
     
     profile_data: Profile = result['responses'][0]
     
-    print("=" * 50)
-    print("DEBUG: Extracted profile data:")
-    print(f"Business ID: {business_id}")
-    print(f"User ID: {user_id}")
-    print(f"Name: {profile_data.name}")
-    print(f"Location: {profile_data.location}")
-    print(f"Address: {profile_data.address}")
-    print(f"Cart: {profile_data.cart}")
-    print(f"Human Active: {profile_data.human_active}")
-    print("=" * 50)
+    logger.info("profile_extracted", business_id=business_id, user_id=user_id, has_name=profile_data.name is not None)
     
-    # Save to LangGraph store
+    # Save to LangGraph store (has its own retry internally)
     for r, rmeta in zip(result["responses"], result["response_metadata"]):
-        await store.aput(
-            namespace,
-            "user_memory",
-            r.model_dump(mode="json"),
-        )
+        await store.aput(namespace, "user_memory", r.model_dump(mode="json"))
     
-    # Convert cart to JSON string before inserting
-    pool = await ensure_pool_health()
-    async with pool.connection() as conn:
-        # Convert cart to JSON - handle both list and dict formats
-        cart_json = json.dumps(profile_data.cart) if profile_data.cart is not None else None
-        
-        await conn.execute(
-            '''
-            INSERT INTO user_profiles (business_id, user_id, name, cart, address, location, human_active, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (business_id, user_id) DO UPDATE SET
-                name = COALESCE(EXCLUDED.name, user_profiles.name),
-                cart = COALESCE(EXCLUDED.cart, user_profiles.cart),
-                address = COALESCE(EXCLUDED.address, user_profiles.address),
-                location = COALESCE(EXCLUDED.location, user_profiles.location),
-                human_active = COALESCE(EXCLUDED.human_active, user_profiles.human_active),
-                updated_at = NOW()
-            ''',
-            (
-                business_id,
-                user_id, 
-                profile_data.name, 
-                cart_json,  
-                profile_data.address,
-                profile_data.location,
-                profile_data.human_active
-            )
-        )
+    # Database save - add retry wrapper
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+        retry=retry_if_exception_type((
+            asyncpg.PostgresError,
+            asyncpg.InterfaceError,
+            ConnectionError,
+        )),
+        reraise=True
+    )
+    async def save_profile_to_db():
+        """Inner function with retry for database save."""
+        async with async_session_factory() as session:
+            profile = await session.get(UserProfile, (business_id, user_id))
+            
+            if not profile:
+                profile = UserProfile(business_id=business_id, user_id=user_id)
+                session.add(profile)
+            
+            # Update fields
+            if profile_data.name is not None:
+                profile.name = profile_data.name
+            if profile_data.location is not None:
+                profile.location = profile_data.location
+            if profile_data.address is not None:
+                profile.address = profile_data.address
+            if profile_data.cart is not None:
+                profile.cart = profile_data.cart
+            if profile_data.human_active is not None:
+                profile.human_active = profile_data.human_active
+            
+            profile.updated_at = func.now()
+            
+            await session.commit()
     
-    # Return tool message
+    # Execute with retry
+    await save_profile_to_db()
+    
+    logger.info("profile_saved", business_id=business_id, user_id=user_id)
+    
     tool_calls = state['messages'][-1].tool_calls
     return {
         "messages": [{
@@ -879,34 +931,26 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
         }]
     }
 
-@retry(
-    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
-    stop=(stop_after_delay(30) | stop_after_attempt(5)),
-    wait=wait_combine(
-        wait_exponential(multiplier=1, max=10),
-        wait_random(min=0, max=2)
-    )
-)
+@monitor(operation="check_address")
 async def check_address_and_finalize(state: MessagesState, config: RunnableConfig):
-    """Check if user has address, ask if not, or prepare for escalation."""
+    """Check if user has address before finalizing order."""
     global store
+    
     user_id = config["configurable"]["user_id"]
     business_id = config["configurable"]["business_id"]
     
-    # FIXED: Consistent namespace
     namespace = ("profile", business_id, user_id)
-    
     existing_memory = await store.aget(namespace, "user_memory")
     
-    # Check for address in profile
     has_address = False
     if existing_memory:
         profile_data = existing_memory.value
         has_address = profile_data.get('address') is not None
     
+    tool_calls = state['messages'][-1].tool_calls
+    
     if not has_address:
-        # Ask for address
-        tool_calls = state['messages'][-1].tool_calls
+        logger.info("address_missing", business_id=business_id, user_id=user_id)
         return {
             "messages": [{
                 "role": "tool",
@@ -915,8 +959,7 @@ async def check_address_and_finalize(state: MessagesState, config: RunnableConfi
             }]
         }
     else:
-        # Has address - ready to escalate
-        tool_calls = state['messages'][-1].tool_calls
+        logger.info("order_ready_to_escalate", business_id=business_id, user_id=user_id)
         return {
             "messages": [{
                 "role": "tool",
@@ -924,22 +967,13 @@ async def check_address_and_finalize(state: MessagesState, config: RunnableConfi
                 "tool_call_id": tool_calls[0]['id']
             }]
         }
-    
-@retry(
-    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
-    stop=(stop_after_delay(30) | stop_after_attempt(5)),
-    wait=wait_combine(
-        wait_exponential(multiplier=1, max=10),
-        wait_random(min=0, max=2)
-    )
-)
+
+@monitor(operation="add_to_cart")
 async def add_to_cart(state: MessagesState, config: RunnableConfig):
-    """Add items to the user's cart with quantity support."""
-    global store
+    """Add items to cart using SQLAlchemy."""
     user_id = config["configurable"]["user_id"]
     business_id = config["configurable"]["business_id"]
     
-    # Configuration
     MAX_CART_SIZE = 50
     MAX_ITEM_QUANTITY = 99
     
@@ -949,16 +983,7 @@ async def add_to_cart(state: MessagesState, config: RunnableConfig):
     
     cart_items = args.get('cart_items', [])
     
-    if not isinstance(cart_items, list):
-        return {
-            "messages": [{
-                "role": "tool",
-                "content": "Invalid cart items format. Expected a list.",
-                "tool_call_id": tool_call['id']
-            }]
-        }
-    
-    if not cart_items:
+    if not isinstance(cart_items, list) or not cart_items:
         return {
             "messages": [{
                 "role": "tool",
@@ -968,55 +993,40 @@ async def add_to_cart(state: MessagesState, config: RunnableConfig):
         }
     
     try:
-        pool = await ensure_pool_health()
-        
-        async with pool.connection() as conn:
-            # Get current cart
-            result = await conn.execute(
-                "SELECT cart FROM user_profiles WHERE business_id = %s AND user_id = %s",
-                (business_id, user_id)
-            )
+        async with async_session_factory() as session:
+            profile = await session.get(UserProfile, (business_id, user_id))
             
-            row = await result.fetchone()
+            if not profile:
+                profile = UserProfile(business_id=business_id, user_id=user_id, cart={})
+                session.add(profile)
             
-            # Parse cart from JSON if it exists
-            if row and row[0]:
-                import json
-                current_cart = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-            else:
-                current_cart = {}
+            current_cart = profile.cart or {}
             
-            # Convert old list format to dict format if needed
+            # Convert old list format to dict
             if isinstance(current_cart, list):
                 current_cart = {item: 1 for item in current_cart}
             
-            # Process new items
             added_items = []
             updated_items = []
             quantity_limited_items = []
             
             for item in cart_items:
-                # Now we only expect dict format
                 if isinstance(item, dict):
                     item_name = item.get('item')
                     quantity = item.get('quantity', 1)
                 else:
-                    # Fallback for safety
                     continue
                 
                 if not item_name:
                     continue
                 
-                # Calculate new quantity
                 current_qty = current_cart.get(item_name, 0)
                 new_qty = current_qty + quantity
                 
-                # Apply quantity limit
                 if new_qty > MAX_ITEM_QUANTITY:
                     new_qty = MAX_ITEM_QUANTITY
                     quantity_limited_items.append(item_name)
                 
-                # Update cart
                 if current_qty == 0:
                     added_items.append(f"{item_name} (x{new_qty})")
                 else:
@@ -1024,7 +1034,6 @@ async def add_to_cart(state: MessagesState, config: RunnableConfig):
                 
                 current_cart[item_name] = new_qty
             
-            # Check unique items limit
             if len(current_cart) > MAX_CART_SIZE:
                 return {
                     "messages": [{
@@ -1034,46 +1043,19 @@ async def add_to_cart(state: MessagesState, config: RunnableConfig):
                     }]
                 }
             
-            # Calculate total items
             total_items = sum(current_cart.values())
             
-            # Convert to JSON before inserting
-            import json
-            cart_json = json.dumps(current_cart)
+            profile.cart = current_cart
+            profile.updated_at = func.now()
             
-            # Update database
-            await conn.execute(
-                '''
-                INSERT INTO user_profiles (business_id, user_id, cart, updated_at)
-                VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (business_id, user_id) DO UPDATE SET
-                    cart = EXCLUDED.cart,
-                    updated_at = NOW()
-                ''',
-                (business_id, user_id, cart_json)
-            )
+            await session.commit()
             
-            # Update store
-            try:
-                namespace = ("profile", business_id, user_id)
-                existing_memory = await store.aget(namespace, "user_memory")
-                
-                if existing_memory:
-                    memory_data = existing_memory.value
-                    memory_data['cart'] = current_cart
-                else:
-                    memory_data = {'cart': current_cart}
-                
-                await store.aput(namespace, "user_memory", memory_data)
-            except Exception as store_error:
-                logger.warning(f"Failed to update store: {store_error}")
+            logger.info("cart_updated", business_id=business_id, user_id=user_id, total_items=total_items)
         
         # Format success message
         message_parts = []
-        
         if added_items:
             message_parts.append(f"Added: {', '.join(added_items)}")
-        
         if updated_items:
             message_parts.append(f"Updated: {', '.join(updated_items)}")
         
@@ -1092,7 +1074,7 @@ async def add_to_cart(state: MessagesState, config: RunnableConfig):
         }
     
     except Exception as e:
-        logger.error(f"Failed to add to cart: {e}")
+        logger.error("add_to_cart_failed", business_id=business_id, user_id=user_id, error=str(e))
         return {
             "messages": [{
                 "role": "tool",
@@ -1101,38 +1083,19 @@ async def add_to_cart(state: MessagesState, config: RunnableConfig):
             }]
         }
 
-@retry(
-    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
-    stop=(stop_after_delay(30) | stop_after_attempt(5)),
-    wait=wait_combine(
-        wait_exponential(multiplier=1, max=10),
-        wait_random(min=0, max=2)
-    )
-)
+@monitor(operation="remove_from_cart")
 async def remove_cart_item(state: MessagesState, config: RunnableConfig):
-    """Remove items from the user's cart with quantity support."""
-    global store
-
+    """Remove items from cart using SQLAlchemy."""
     user_id = config["configurable"]["user_id"]
     business_id = config["configurable"]["business_id"]
-
+    
     last_message = state["messages"][-1]
     tool_call = last_message.tool_calls[0]
     args = tool_call.get("args", {})
-
-    items_to_remove = args.get("items_to_remove", [])
-
     
-    if not isinstance(items_to_remove, list):
-        return {
-            "messages": [{
-                "role": "tool",
-                "content": "Invalid items format. Expected a list.",
-                "tool_call_id": tool_call["id"]
-            }]
-        }
-
-    if not items_to_remove:
+    items_to_remove = args.get("items_to_remove", [])
+    
+    if not isinstance(items_to_remove, list) or not items_to_remove:
         return {
             "messages": [{
                 "role": "tool",
@@ -1140,29 +1103,12 @@ async def remove_cart_item(state: MessagesState, config: RunnableConfig):
                 "tool_call_id": tool_call["id"]
             }]
         }
-
+    
     try:
-        pool = await ensure_pool_health()
-
-        async with pool.connection() as conn:
-            # ---- Load cart ----
-            result = await conn.execute(
-                "SELECT cart FROM user_profiles WHERE business_id = %s AND user_id = %s",
-                (business_id, user_id)
-            )
-            row = await result.fetchone()
-
-            raw_cart = row[0] if row else None
-
-            # Normalize cart format → always a dict
-            if isinstance(raw_cart, str):
-                current_cart = json.loads(raw_cart)
-            elif isinstance(raw_cart, list):
-                current_cart = {item: 1 for item in raw_cart}
-            else:
-                current_cart = raw_cart or {}
-
-            if not current_cart:
+        async with async_session_factory() as session:
+            profile = await session.get(UserProfile, (business_id, user_id))
+            
+            if not profile or not profile.cart:
                 return {
                     "messages": [{
                         "role": "tool",
@@ -1170,28 +1116,31 @@ async def remove_cart_item(state: MessagesState, config: RunnableConfig):
                         "tool_call_id": tool_call["id"]
                     }]
                 }
-
+            
+            current_cart = profile.cart
+            if isinstance(current_cart, list):
+                current_cart = {item: 1 for item in current_cart}
+            
             removed_items = []
             updated_items = []
             not_found_items = []
-
-            # ---- Process removals ----
+            
             for item in items_to_remove:
                 if not isinstance(item, dict):
                     continue
-
+                
                 item_name = item.get("item")
                 quantity_to_remove = item.get("quantity", 1)
-
+                
                 if not item_name:
                     continue
-
+                
                 if item_name not in current_cart:
                     not_found_items.append(item_name)
                     continue
-
+                
                 current_qty = current_cart[item_name]
-
+                
                 if quantity_to_remove >= current_qty:
                     removed_items.append(f"{item_name} (all {current_qty} removed)")
                     del current_cart[item_name]
@@ -1199,63 +1148,43 @@ async def remove_cart_item(state: MessagesState, config: RunnableConfig):
                     new_qty = current_qty - quantity_to_remove
                     current_cart[item_name] = new_qty
                     updated_items.append(f"{item_name} ({current_qty} → {new_qty})")
-
-            # ---- No changes? ----
+            
             if not removed_items and not updated_items:
                 available_items = [f"{item} (x{qty})" for item, qty in current_cart.items()]
                 return {
                     "messages": [{
                         "role": "tool",
-                        "content": (
-                            f"Could not find items to remove: {', '.join(not_found_items)}. "
-                            f"Your cart contains: {', '.join(available_items)}."
-                        ),
+                        "content": f"Could not find items to remove: {', '.join(not_found_items)}. Your cart contains: {', '.join(available_items)}.",
                         "tool_call_id": tool_call["id"]
                     }]
                 }
-
-            # ---- Save updated cart ----
-            await conn.execute(
-                """
-                UPDATE user_profiles
-                SET cart = %s, updated_at = NOW()
-                WHERE business_id = %s AND user_id = %s
-                """,
-                (json.dumps(current_cart), business_id, user_id)
-            )
-
-            # ---- Update memory store (optional) ----
-            try:
-                namespace = ("profile", business_id, user_id)
-                existing_memory = await store.aget(namespace, "user_memory")
-                memory_data = existing_memory.value if existing_memory else {}
-                memory_data["cart"] = current_cart
-                await store.aput(namespace, "user_memory", memory_data)
-            except Exception as store_error:
-                logger.warning(f"Failed to update store, but database was updated: {store_error}")
-
-        # ---- Build success message ----
+            
+            profile.cart = current_cart
+            profile.updated_at = func.now()
+            
+            await session.commit()
+            
+            logger.info("cart_items_removed", business_id=business_id, user_id=user_id, removed=len(removed_items))
+        
+        # Build success message
         parts = []
         if removed_items:
             parts.append(f"Removed completely: {', '.join(removed_items)}")
         if updated_items:
             parts.append(f"Reduced quantity: {', '.join(updated_items)}")
-
+        
         message = ". ".join(parts) if parts else "Cart updated"
-
+        
         if current_cart:
             remaining_items = [f"{item} (x{qty})" for item, qty in current_cart.items()]
             total_remaining = sum(current_cart.values())
-            message += (
-                f". Cart now has {len(current_cart)} unique item(s) ({total_remaining} total): "
-                f"{', '.join(remaining_items)}."
-            )
+            message += f". Cart now has {len(current_cart)} unique item(s) ({total_remaining} total): {', '.join(remaining_items)}."
         else:
             message += ". Your cart is now empty."
-
+        
         if not_found_items:
             message += f" Note: Could not find: {', '.join(not_found_items)}."
-
+        
         return {
             "messages": [{
                 "role": "tool",
@@ -1263,9 +1192,9 @@ async def remove_cart_item(state: MessagesState, config: RunnableConfig):
                 "tool_call_id": tool_call["id"]
             }]
         }
-
+    
     except Exception as e:
-        logger.error(f"Failed to remove from cart: {e}")
+        logger.error("remove_cart_item_failed", business_id=business_id, user_id=user_id, error=str(e))
         return {
             "messages": [{
                 "role": "tool",
@@ -1274,380 +1203,9 @@ async def remove_cart_item(state: MessagesState, config: RunnableConfig):
             }]
         }
 
-
-
-## RAG
-
-# Setup logging
-logger = logging.getLogger(__name__)
-
-# Configuration
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-
-# KB1 Setup - MAKE THIS CONFIGURABLE OR USE ENVIRONMENT VARIABLE
-KB1_DOC_PATH = os.getenv("KB1_DOC_PATH", "synthetic_restaurant_menu_10000.csv")
-
-# 
-_vector_store_cache = {}
-_retriever_cache = {}
-_file_hash_cache = {}
-_embeddings_cache = None  
-_documents_loaded = {} 
-
-
-async def get_file_hash(path):
-    """Compute a hash of the file contents to detect changes."""
-    hasher = hashlib.sha256()
-    loop = asyncio.get_event_loop()
-    
-    def _read_file():
-        with open(path, "rb") as f:
-            return hasher.update(f.read())
-    
-    await loop.run_in_executor(None, _read_file)
-    return hasher.hexdigest()
-
-@retry(
-    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
-    stop=(stop_after_delay(30) | stop_after_attempt(5)),
-    wait=wait_combine(
-        wait_exponential(multiplier=1, max=10),
-        wait_random(min=0, max=2)
-    )
-)
-async def initialize_rag(business_id: str = None, doc_path: str = None, doc_paths: List = None):
-    """Initialize RAG - accepts single doc_path or multiple doc_paths"""
-    global _vector_store_cache, _retriever_cache, _file_hash_cache, _embeddings_cache, _documents_loaded
-    
-    # Validate business_id
-    if not business_id:
-        raise ValueError("business_id is required for RAG initialization")
-    
-    # Check if already initialized for THIS business
-    if business_id in _retriever_cache and _documents_loaded.get(business_id, False):
-        print(f"RAG already initialized for business {business_id}")
-        return _retriever_cache[business_id]
-    
-    
-    # Handle both parameter names
-    if doc_path and not doc_paths:
-        doc_paths = [doc_path]
-    
-    if not doc_paths:
-        doc_paths = await get_business_document(business_id)
-        if not doc_paths:
-            raise ValueError(f"No document for business '{business_id}'")
-        doc_paths = [doc_paths]
-    
-    try:
-        # Initialize embeddings once and store in global cache (shared across businesses)
-        if _embeddings_cache is None:
-            print("Initializing embeddings model...")
-            _embeddings_cache = HuggingFaceEmbeddings(
-                model_name=EMBEDDING_MODEL_NAME,
-                model_kwargs={'device': 'cpu'}
-            )
-        
-        loop = asyncio.get_event_loop()
-        
-        collection_name = f"business_{business_id}_menu"
-        print(f"Connecting to Supabase pgvector for collection: {collection_name}")
-        
-        # Initialize PGVector connection to Supabase (use pooler)
-        vector_store = PGVector(
-            embeddings=_embeddings_cache,
-            collection_name=collection_name,
-            connection=POSTGRES_URI_POOLER,
-            use_jsonb=True,
-            async_mode=True,
-            pre_delete_collection=False,
-            create_extension=False, 
-        )
-        
-        # Check if documents exist in THIS specific collection using database query
-        try:
-            print(f"Checking database for documents in collection: {collection_name}...")
-            pool = await ensure_pool_health()
-            
-            async with pool.connection() as conn:
-                result = await conn.execute(
-                    """
-                    SELECT COUNT(*) 
-                    FROM langchain_pg_embedding 
-                    WHERE collection_id = (
-                        SELECT uuid 
-                        FROM langchain_pg_collection 
-                        WHERE name = %s
-                    )
-                    """,
-                    (collection_name,)
-                )
-                row = await result.fetchone()
-                doc_count = row[0] if row else 0
-                
-                print(f"Found {doc_count} documents in collection {collection_name}")
-                
-                if doc_count > 0:
-                    # Check if any file has changed
-                    doc_paths_list = doc_paths if isinstance(doc_paths, list) else [doc_paths]
-                    current_hashes = await asyncio.gather(*[get_file_hash(path) for path in doc_paths_list])
-                    
-                    if business_id in _file_hash_cache and _file_hash_cache[business_id] != current_hashes:
-                        print(f"Document files have changed for business {business_id}, will refresh...")
-                        await refresh_rag(business_id=business_id, doc_paths=doc_paths)
-                        return _retriever_cache[business_id]
-                    
-                    # Documents exist and files haven't changed
-                    _file_hash_cache[business_id] = current_hashes
-                    _documents_loaded[business_id] = True
-                    _vector_store_cache[business_id] = vector_store
-                    _retriever_cache[business_id] = vector_store.as_retriever(search_kwargs={"k": 5})
-                    print(f"RAG initialized from existing documents for business {business_id}")
-                    return _retriever_cache[business_id]
-                else:
-                    print(f"No documents found in collection {collection_name}, will load from files")
-                    
-        except Exception as e:
-            print(f"Error checking collection for business {business_id}: {e}")
-            print("Will proceed to load documents from files...")
-        
-        # Load and process documents
-        print(f"Building knowledge base from files for business {business_id}...")
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
-        
-        # Configuration
-        DOC_LOAD_BATCH_SIZE = 5      
-        EMBEDDING_BATCH_SIZE = 256    
-        VECTOR_INSERT_BATCH_SIZE = 100
-                
-        # Ensure doc_paths is a list
-        doc_paths_list = doc_paths if isinstance(doc_paths, list) else [doc_paths]
-        all_documents = []
-
-        # Process documents in batches to avoid memory issues
-        print(f"Processing {len(doc_paths_list)} documents in batches of {DOC_LOAD_BATCH_SIZE}...")
-        
-        for batch_idx in range(0, len(doc_paths_list), DOC_LOAD_BATCH_SIZE):
-            batch_paths = doc_paths_list[batch_idx:batch_idx + DOC_LOAD_BATCH_SIZE]
-            print(f"\nProcessing batch {batch_idx//DOC_LOAD_BATCH_SIZE + 1}/{(len(doc_paths_list) + DOC_LOAD_BATCH_SIZE - 1)//DOC_LOAD_BATCH_SIZE}")
-            
-            # Load documents in this batch
-            loaded_docs = []
-            for doc_path in batch_paths:
-                if not doc_path or not os.path.exists(doc_path):
-                    raise ValueError(f"Document path does not exist: {doc_path}")
-                    
-                print(f"  Loading {os.path.basename(doc_path)}...")
-                if doc_path.lower().endswith(".pdf"):
-                    loader = PyPDFLoader(doc_path)
-                elif doc_path.lower().endswith(".docx"):
-                    loader = Docx2txtLoader(doc_path)
-                elif doc_path.lower().endswith(".csv"):
-                    loader = CSVLoader(file_path=doc_path, encoding="utf-8-sig")
-                else:
-                    raise ValueError(f"Unsupported file format: {doc_path}")
-                
-                if hasattr(loader, 'aload'):
-                    docs = await loader.aload()
-                else:
-                    docs = await loop.run_in_executor(None, loader.load)
-                
-                loaded_docs.append(docs)
-                print(f"    Loaded {len(docs)} pages/rows")
-
-            # Split documents in this batch in parallel
-            print(f"  Splitting {len(loaded_docs)} documents in parallel...")
-            chunk_results = await asyncio.gather(*[
-                loop.run_in_executor(None, splitter.split_documents, docs)
-                for docs in loaded_docs
-            ])
-
-            # Flatten chunks from this batch
-            batch_chunks = []
-            for chunks in chunk_results:
-                batch_chunks.extend(chunks)
-            
-            all_documents.extend(batch_chunks)
-            print(f"  Created {len(batch_chunks)} chunks from this batch (Total: {len(all_documents)})")
-
-        if not all_documents:
-            raise ValueError("No documents were loaded")
-
-        print(f"\nTotal chunks created: {len(all_documents)}")
-
-        # Store file hashes per business
-        _file_hash_cache[business_id] = await asyncio.gather(*[get_file_hash(path) for path in doc_paths_list])
-        
-        # ============================================================
-        # BATCH EMBEDDING GENERATION (Safe and Fast)
-        # ============================================================
-        print(f"\nGenerating embeddings for {len(all_documents)} chunks...")
-        print(f"Using batch size of {EMBEDDING_BATCH_SIZE} for optimal performance")
-        
-        texts = [doc.page_content for doc in all_documents]
-        metadatas = [doc.metadata for doc in all_documents]
-        all_embeddings = []
-        
-        # Generate embeddings in batches using the model's native batching
-        for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-            batch_texts = texts[i:i + EMBEDDING_BATCH_SIZE]
-            
-            # Use embed_documents (plural) - this is thread-safe and internally optimized
-            batch_embeddings = await loop.run_in_executor(
-                None,
-                _embeddings_cache.embed_documents,  # Native batch method
-                batch_texts
-            )
-            
-            all_embeddings.extend(batch_embeddings)
-            
-            progress = min(i + EMBEDDING_BATCH_SIZE, len(texts))
-            print(f"  Embeddings: {progress}/{len(texts)} ({progress*100//len(texts)}%)")
-        
-        print(f"✓ Generated {len(all_embeddings)} embeddings")
-        
-        # ============================================================
-        # ADD PRE-EMBEDDED DOCUMENTS TO VECTOR STORE
-        # ============================================================
-        print(f"\nAdding {len(all_embeddings)} pre-embedded documents to Supabase...")
-        print(f"Using insert batch size of {VECTOR_INSERT_BATCH_SIZE}")
-        
-        # Add documents with pre-computed embeddings in batches
-        for i in range(0, len(all_embeddings), VECTOR_INSERT_BATCH_SIZE):
-            batch_size = min(VECTOR_INSERT_BATCH_SIZE, len(all_embeddings) - i)
-            
-            batch_texts = texts[i:i + batch_size]
-            batch_embeddings = all_embeddings[i:i + batch_size]
-            batch_metadatas = metadatas[i:i + batch_size]
-            
-            # Create tuples of (text, embedding) as required by add_embeddings
-            text_embedding_pairs = list(zip(batch_texts, batch_embeddings))
-            
-            # Add to vector store with pre-computed embeddings
-            if hasattr(vector_store, 'aadd_embeddings'):
-                # await vector_store.aadd_embeddings(
-                #     text_embeddings=text_embedding_pairs,
-                #     metadatas=batch_metadatas
-                # )
-                await vector_store.aadd_embeddings(
-                    texts=batch_texts,
-                    embeddings=batch_embeddings,
-                    metadatas=batch_metadatas
-                )
-            elif hasattr(vector_store, 'add_embeddings'):
-                await loop.run_in_executor(
-                    None,
-                    vector_store.add_embeddings,
-                    text_embedding_pairs,
-                    batch_metadatas
-                )
-            else:
-                # Fallback: reconstruct documents with embeddings
-                # This shouldn't re-compute embeddings since we're providing them
-                batch_docs = [
-                    type(all_documents[i + j])(
-                        page_content=batch_texts[j],
-                        metadata=batch_metadatas[j]
-                    )
-                    for j in range(len(batch_texts))
-                ]
-                
-                if hasattr(vector_store, 'aadd_documents'):
-                    await vector_store.aadd_documents(batch_docs)
-                else:
-                    await loop.run_in_executor(None, vector_store.add_documents, batch_docs)
-            
-            progress = min(i + batch_size, len(all_embeddings))
-            print(f"  Progress: {progress}/{len(all_embeddings)} ({progress*100//len(all_embeddings)}%)")
-        
-        _documents_loaded[business_id] = True
-        _vector_store_cache[business_id] = vector_store
-        _retriever_cache[business_id] = vector_store.as_retriever(search_kwargs={"k": 5})
-        print(f"\nSetup complete - {len(all_documents)} documents indexed in Supabase for business {business_id}!")
-        
-        return _retriever_cache[business_id]
-      
-    except Exception as e:
-        logger.error(f"RAG initialization failed for business {business_id}: {e}")
-        raise
-
-
-async def refresh_rag(business_id=None, doc_path=None):
-    """Refresh RAG when file changes detected - clears and reloads documents for a specific business."""
-    global _vector_store_cache, _retriever_cache, _file_hash_cache, _embeddings_cache, _documents_loaded
-    
-    if not business_id:
-        raise ValueError("business_id is required for RAG refresh")
-    
-    print(f"Refreshing knowledge base for business {business_id}...")
-    
-    loop = asyncio.get_event_loop()
-    
-    # Delete existing collection in Supabase for this business
-    if business_id in _vector_store_cache:
-        try:
-            print(f"Clearing existing documents from Supabase for business {business_id}...")
-            await loop.run_in_executor(
-                None,
-                lambda: _vector_store_cache[business_id].delete_collection()
-            )
-            print("Collection cleared")
-        except Exception as e:
-            print(f"Error clearing collection: {e}")
-    
-    # Clear cache for this business only
-    _vector_store_cache.pop(business_id, None)
-    _retriever_cache.pop(business_id, None)
-    _file_hash_cache.pop(business_id, None)
-    _documents_loaded.pop(business_id, None)
-    # Keep embeddings cache to avoid reloading model
-    
-    # Reinitialize for this business
-    retriever = await initialize_rag(business_id=business_id, doc_path=doc_path)
-    print(f"Knowledge base refreshed for business {business_id}!")
-    
-    return retriever
-
-
-# File change handler
-class KBUpdateHandler(FileSystemEventHandler):
-    def __init__(self, business_id):
-        self.business_id = business_id
-        super().__init__()
-    
-    def on_modified(self, event):
-        if event.src_path == os.path.abspath(KB1_DOC_PATH):
-            print(f"Detected change in file: {event.src_path} for business {self.business_id}")
-            try:
-                asyncio.create_task(refresh_rag(business_id=self.business_id))
-            except Exception as e:
-                logger.error(f"Error refreshing: {e}")
-
-
-def start_file_monitoring(business_id):
-    """Start watching file for changes for a specific business."""
-    event_handler = KBUpdateHandler(business_id)
-    observer = Observer()
-    
-    kb_dir = os.path.dirname(os.path.abspath(KB1_DOC_PATH))
-    observer.schedule(event_handler, kb_dir, recursive=False)
-    
-    observer.start()
-    print(f"File monitoring started for business {business_id}...")
-    return observer
-
-
-@retry(
-    retry=retry_if_exception_type(WHATSAPP_CHATBOT_EXCEPTIONS),
-    stop=(stop_after_delay(40) | stop_after_attempt(5)),
-    wait=wait_combine(
-        wait_exponential(multiplier=1, max=10),
-        wait_random(min=0, max=2)
-    )
-)
-
+@monitor(operation="rag_search")
 async def rag_search(state: MessagesState, config: RunnableConfig):
-    """Perform RAG search on knowledge base."""
+    """Perform RAG search."""
     business_id = config["configurable"]["business_id"]
     
     last_message = state["messages"][-1]
@@ -1665,35 +1223,25 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
         }
     
     try:
+        # Get cached config (triggers init if needed)
+        rag_config = await initialize_rag(business_id=business_id)
         
-        init_lock = await get_init_lock(business_id)
-        async with init_lock:
-            if business_id not in _retriever_cache:
-                await initialize_rag(business_id=business_id)
+        # Create fresh retriever
+        vector_store = PGVectorStore.from_params(
+            connection_string=POSTGRES_URI_POOLER,
+            table_name=rag_config["collection_name"],
+            embed_dim=384,
+            hybrid_search=False,
+        )
         
-        retriever = _retriever_cache.get(business_id)
+        index = VectorStoreIndex.from_vector_store(vector_store)
+        retriever = index.as_retriever(similarity_top_k=5)
         
-        if not retriever:
-            return {
-                "messages": [{
-                    "role": "tool",
-                    "content": "Knowledge base not initialized. Please contact support.",
-                    "tool_call_id": tool_call['id']
-                }]
-            }
+        # Query
+        nodes = await retriever.aretrieve(search_query)
         
-        # This part might benefit from retry (connection issues during search)
-        loop = asyncio.get_event_loop()
-        if hasattr(retriever, 'ainvoke'):
-            relevant_docs=await retriever.ainvoke(search_query)
-        else:
-            # Fallback logic
-            relevant_docs = await loop.run_in_executor(
-                None, 
-                lambda: retriever.invoke(search_query)
-            )
-        
-        if not relevant_docs:
+        if not nodes:
+            logger.info("rag_search_no_results", business_id=business_id, query=search_query)
             return {
                 "messages": [{
                     "role": "tool",
@@ -1702,7 +1250,9 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
                 }]
             }
         
-        context = "\n\n".join([doc.page_content for doc in relevant_docs])
+        context = "\n\n".join([node.node.text for node in nodes])
+        
+        logger.info("rag_search_success", business_id=business_id, results_count=len(nodes))
         
         return {
             "messages": [{
@@ -1712,19 +1262,8 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
             }]
         }
     
-    except (APIError, RateLimitError, Timeout) as e:
-        
-        logger.error(f"RAG initialization failed after retries for business {business_id}: {e}")
-        return {
-            "messages": [{
-                "role": "tool",
-                "content": "Sorry, knowledge base initialization failed. Please try again later.",
-                "tool_call_id": tool_call['id']
-            }]
-        }
     except Exception as e:
-        # Other errors get logged and returned (or let retry wrapper handle if it's ConnectionError/OSError)
-        logger.error(f"RAG search failed for business {business_id}: {e}", exc_info=True)
+        logger.error("rag_search_failed", business_id=business_id, error=str(e))
         return {
             "messages": [{
                 "role": "tool",
@@ -1732,10 +1271,14 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
                 "tool_call_id": tool_call['id']
             }]
         }
-
+    
+    
+# ============================================
+# ROUTING
+# ============================================
 
 def route_customer_action(state: MessagesState) -> str:
-    """Route to the appropriate action node based on priority."""
+    """Route to the appropriate action node."""
     last_message = state["messages"][-1]
     
     if not (hasattr(last_message, 'tool_calls') and last_message.tool_calls):
@@ -1743,9 +1286,6 @@ def route_customer_action(state: MessagesState) -> str:
     
     tool_call = last_message.tool_calls[0]
     args = tool_call.get('args', {})
-    
-    # Simple priority: Process ONE action at a time
-    # Chatbot will handle the rest autonomously
     
     if args.get('ready_to_order'):
         return "check_address_and_finalize"
@@ -1764,8 +1304,10 @@ def route_customer_action(state: MessagesState) -> str:
     
     return "__end__"
 
+# ============================================
+# GRAPH BUILDING
+# ============================================
 
-# Build the graph
 builder = StateGraph(MessagesState)
 builder.add_node("chatbot", chatbot)
 builder.add_node("write_memory", write_memory)
@@ -1789,25 +1331,25 @@ builder.add_conditional_edges(
     }
 )
 
-# All actions loop back to chatbot
 builder.add_edge("write_memory", "chatbot")
 builder.add_edge("rag_search", "chatbot")
 builder.add_edge("check_address_and_finalize", "chatbot")
 builder.add_edge("add_to_cart", "chatbot")
 builder.add_edge("remove_cart_item", "chatbot")
 
-
+# ============================================
+# GRAPH INITIALIZATION
+# ============================================
+@monitor(operation="initialize_graph")
 async def initialize_graph():
     """Initialize the graph with database connection."""
     global store, saver
     
-    logger.info("Initializing graph...")
+    logger.info("graph_initialization_started")
     
-    # FIXED: Correct variable order matching setup_database return
     store, saver = await setup_database()
     
-    logger.info("Compiling graph...")
     compiled_graph = builder.compile(checkpointer=saver, store=store)
     
-    logger.info("✅ Graph initialized successfully!")
+    logger.info("graph_initialized")
     return compiled_graph
