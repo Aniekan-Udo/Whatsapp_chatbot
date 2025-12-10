@@ -5,6 +5,8 @@ langgraph
 # LLM Providers
 langchain-groq
 
+fastapi
+
 # Database
 asyncpg
 psycopg[binary,pool]
