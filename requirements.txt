@@ -22,7 +22,7 @@ alembic
 llama-index-core
 llama-index-vector-stores-postgres
 llama-index-embeddings-ollama
-llama_index.embeddings.fastembed
+llama_index.embeddings.fastembed==0.7.4
 # Caching & Performance
 cashews[redis]
 aiocache[redis]
