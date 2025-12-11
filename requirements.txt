@@ -11,7 +11,7 @@ langchain-groq
 # Web Framework
 fastapi
 uvicorn[standard]
-
+aiofiles
 # Database
 asyncpg
 psycopg[binary,pool]
