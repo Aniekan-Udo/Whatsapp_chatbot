@@ -652,88 +652,162 @@ logger.info("cache_initialized", backend="memory")
     reraise=True
 )
 @monitor(operation="rag_init")
-async def initialize_rag(business_id: str = None, doc_path: str = None, doc_paths: List = None):
-    """Initialize RAG and return config."""
+async def initialize_rag(
+    business_id: str = None, 
+    doc_path: str = None, 
+    doc_paths: List[str] = None,
+    force_reinit: bool = False
+) -> Dict[str, Any]:
+    """
+    Initialize RAG for a business and return config.
+    
+    This function:
+    1. Checks if RAG is already initialized (table exists)
+    2. If not, loads documents and creates vector embeddings
+    3. Returns a config dict that can be cached
+    
+    Args:
+        business_id: The business ID to initialize RAG for
+        doc_path: Single document path (optional)
+        doc_paths: List of document paths (optional)
+        force_reinit: Force reinitialization even if table exists
+    
+    Returns:
+        Dict with collection_name and status
+    """
     
     if not business_id:
         raise ValueError("business_id is required")
     
     collection_name = f"business_{business_id}_menu"
     
-    # Check if already initialized (table exists)
-    try:
-        vector_store = PGVectorStore.from_params(
-            connection_string=POSTGRES_URI_POOLER,
-            table_name=collection_name,
-            embed_dim=384,
-            hybrid_search=False,
-            perform_setup=False,  # Don't create if checking
-        )
-        # Try a simple query to verify table exists and has data
-        index = VectorStoreIndex.from_vector_store(vector_store)
-        
-        logger.info("rag_already_initialized", business_id=business_id)
-        return {"collection_name": collection_name}
-        
-    except Exception:
-        # Table doesn't exist or is empty, do full initialization
-        logger.info("rag_initialization_started", business_id=business_id)
+    # Check if already initialized (table exists with data) unless force_reinit
+    if not force_reinit:
+        try:
+            vector_store = PGVectorStore.from_params(
+                connection_string=POSTGRES_URI_POOLER,
+                table_name=collection_name,
+                embed_dim=384,
+                hybrid_search=False,
+                perform_setup=False,  # Don't create table, just check
+            )
+            
+            # Quick check if table has data
+            index = VectorStoreIndex.from_vector_store(vector_store)
+            
+            logger.info("rag_already_initialized", business_id=business_id)
+            return {
+                "collection_name": collection_name,
+                "status": "existing",
+                "business_id": business_id
+            }
+            
+        except Exception as e:
+            # Table doesn't exist or is inaccessible, proceed with initialization
+            logger.info("rag_initialization_needed", 
+                       business_id=business_id,
+                       reason=str(e))
     
-    # Get documents
+    logger.info("rag_initialization_started", business_id=business_id)
+    
+    # Get document paths
     if doc_path and not doc_paths:
         doc_paths = [doc_path]
+    
     if not doc_paths:
         doc_paths = await get_business_document(business_id)
         if not doc_paths:
-            raise ValueError(f"No document for business '{business_id}'")
-        doc_paths = [doc_paths] if isinstance(doc_paths, str) else doc_paths
+            raise ValueError(f"No documents found for business '{business_id}'")
     
-    # Validate files
+    # Ensure doc_paths is a list
+    if isinstance(doc_paths, str):
+        doc_paths = [doc_paths]
+    
+    # Validate files exist
+    missing_files = []
     for path in doc_paths:
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Document not found: {path}")
+            missing_files.append(path)
+    
+    if missing_files:
+        raise FileNotFoundError(
+            f"Documents not found: {', '.join(missing_files)}"
+        )
     
     # Load documents
+    logger.info("loading_documents", 
+               business_id=business_id, 
+               file_count=len(doc_paths))
+    
     documents = SimpleDirectoryReader(input_files=doc_paths).load_data()
+    
     if not documents:
-        raise ValueError(f"No documents loaded from {doc_paths}")
+        raise ValueError(f"No documents could be loaded from {doc_paths}")
     
-    logger.info("documents_loaded", business_id=business_id, count=len(documents))
+    logger.info("documents_loaded", 
+               business_id=business_id, 
+               document_count=len(documents),
+               total_chars=sum(len(doc.text) for doc in documents))
     
-    # Create vector store and index
-    vector_store = PGVectorStore.from_params(
-        connection_string=POSTGRES_URI,
-        table_name=collection_name,
-        embed_dim=384,
-        hybrid_search=False,
-        perform_setup=True,
-        hnsw_kwargs={
-            "hnsw_m": 16,
-            "hnsw_ef_construction": 64,
-            "hnsw_ef_search": 40,
-            "hnsw_dist_method": "vector_cosine_ops",
-        },
-    )
+    # Create vector store with DIRECT connection (not pooler for long operations)
+    try:
+        vector_store = PGVectorStore.from_params(
+            connection_string=POSTGRES_URI_DIRECT,  # Use direct for indexing
+            table_name=collection_name,
+            embed_dim=384,
+            hybrid_search=False,  # Disabled to avoid int conversion issues
+            perform_setup=True,  # Create table and indexes
+            hnsw_kwargs={
+                "hnsw_m": 16,
+                "hnsw_ef_construction": 64,
+                "hnsw_ef_search": 40,
+                "hnsw_dist_method": "vector_cosine_ops",
+            },
+        )
+        
+        logger.info("vector_store_created", 
+                   business_id=business_id,
+                   table_name=collection_name)
+        
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        
+        # Create index (this ingests and embeds documents - takes time)
+        logger.info("creating_embeddings", business_id=business_id)
+        
+        VectorStoreIndex.from_documents(
+            documents,
+            storage_context=storage_context,
+            show_progress=True
+        )
+        
+        logger.info("embeddings_created", business_id=business_id)
+        
+    except Exception as e:
+        logger.error("vector_store_creation_failed", 
+                    business_id=business_id,
+                    error=str(e),
+                    error_type=type(e).__name__)
+        raise
     
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    
-    VectorStoreIndex.from_documents(
-        documents,
-        storage_context=storage_context,
-        show_progress=True
-    )
-    
-    # Create metadata indexes
+    # Create metadata indexes for better query performance
     try:
         await create_metadata_indexes(business_id)
     except Exception as idx_error:
+        # Don't fail if index creation fails
         logger.warning("metadata_index_creation_skipped", 
                      business_id=business_id, 
                      error=str(idx_error))
     
-    logger.info("rag_initialized", business_id=business_id)
+    logger.info("rag_initialized_successfully", 
+               business_id=business_id,
+               collection_name=collection_name)
     
-    return {"collection_name": collection_name}
+    return {
+        "collection_name": collection_name,
+        "status": "created",
+        "business_id": business_id,
+        "document_count": len(documents)
+    }
             
 
 # ============================================
@@ -1205,8 +1279,26 @@ async def remove_cart_item(state: MessagesState, config: RunnableConfig):
 
 @monitor(operation="rag_search")
 async def rag_search(state: MessagesState, config: RunnableConfig):
-    """Perform RAG search."""
-    business_id = config["configurable"]["business_id"]
+    """
+    Perform RAG search with timeout protection and graceful error handling.
+    
+    This function:
+    1. Initializes RAG if needed (with timeout)
+    2. Creates a retriever from cached config
+    3. Performs semantic search
+    4. Returns formatted results to the agent
+    """
+    business_id = config["configurable"].get("business_id")
+    
+    if not business_id:
+        logger.error("rag_search_missing_business_id")
+        return {
+            "messages": [{
+                "role": "tool",
+                "content": "Configuration error: business_id not provided.",
+                "tool_call_id": state["messages"][-1].tool_calls[0]['id']
+            }]
+        }
     
     last_message = state["messages"][-1]
     tool_call = last_message.tool_calls[0]
@@ -1222,37 +1314,124 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
             }]
         }
     
+    logger.info("rag_search_started", 
+               business_id=business_id,
+               query=search_query[:100])  # Log first 100 chars
+    
     try:
-        # Get cached config (triggers init if needed)
-        rag_config = await initialize_rag(business_id=business_id)
-        
-        # Create fresh retriever
-        vector_store = PGVectorStore.from_params(
-            connection_string=POSTGRES_URI_POOLER,
-            table_name=rag_config["collection_name"],
-            embed_dim=384,
-            hybrid_search=False,
-        )
-        
-        index = VectorStoreIndex.from_vector_store(vector_store)
-        retriever = index.as_retriever(similarity_top_k=5)
-        
-        # Query
-        nodes = await retriever.aretrieve(search_query)
-        
-        if not nodes:
-            logger.info("rag_search_no_results", business_id=business_id, query=search_query)
+        # Step 1: Initialize RAG with timeout protection
+        try:
+            rag_config = await asyncio.wait_for(
+                initialize_rag(business_id=business_id),
+                timeout=45.0  # 45 second timeout for initialization
+            )
+        except asyncio.TimeoutError:
+            logger.error("rag_init_timeout", business_id=business_id)
             return {
                 "messages": [{
                     "role": "tool",
-                    "content": "I couldn't find any information about that in the knowledge base.",
+                    "content": "The knowledge base is still loading. This can take a few minutes on first use. Please try your question again in a moment.",
+                    "tool_call_id": tool_call['id']
+                }]
+            }
+        except Exception as init_error:
+            logger.error("rag_init_failed", 
+                        business_id=business_id, 
+                        error=str(init_error),
+                        error_type=type(init_error).__name__)
+            return {
+                "messages": [{
+                    "role": "tool",
+                    "content": "I'm having trouble accessing the knowledge base right now. Please try again or contact support if the issue persists.",
                     "tool_call_id": tool_call['id']
                 }]
             }
         
-        context = "\n\n".join([node.node.text for node in nodes])
+        logger.info("rag_config_retrieved", 
+                   business_id=business_id,
+                   status=rag_config.get("status"))
         
-        logger.info("rag_search_success", business_id=business_id, results_count=len(nodes))
+        # Step 2: Create retriever with POOLER connection (fast for queries)
+        try:
+            vector_store = PGVectorStore.from_params(
+                connection_string=POSTGRES_URI_POOLER,  # Use pooler for queries
+                table_name=rag_config["collection_name"],
+                embed_dim=384,
+                hybrid_search=False,
+            )
+            
+            index = VectorStoreIndex.from_vector_store(vector_store)
+            retriever = index.as_retriever(
+                similarity_top_k=5,
+                vector_store_query_mode="default"
+            )
+            
+            logger.info("retriever_created", business_id=business_id)
+            
+        except Exception as retriever_error:
+            logger.error("retriever_creation_failed",
+                        business_id=business_id,
+                        error=str(retriever_error))
+            return {
+                "messages": [{
+                    "role": "tool",
+                    "content": "Error creating search interface. Please try again.",
+                    "tool_call_id": tool_call['id']
+                }]
+            }
+        
+        # Step 3: Perform search with timeout
+        try:
+            nodes = await asyncio.wait_for(
+                retriever.aretrieve(search_query),
+                timeout=10.0  # 10 second timeout for search
+            )
+            
+        except asyncio.TimeoutError:
+            logger.error("rag_search_timeout", 
+                        business_id=business_id, 
+                        query=search_query[:100])
+            return {
+                "messages": [{
+                    "role": "tool",
+                    "content": "The search is taking longer than expected. Please try a more specific query or try again.",
+                    "tool_call_id": tool_call['id']
+                }]
+            }
+        
+        # Step 4: Process results
+        if not nodes:
+            logger.info("rag_search_no_results", 
+                       business_id=business_id, 
+                       query=search_query[:100])
+            return {
+                "messages": [{
+                    "role": "tool",
+                    "content": "I couldn't find any information about that in the knowledge base. Please try rephrasing your question or ask about something else.",
+                    "tool_call_id": tool_call['id']
+                }]
+            }
+        
+        # Format results with source information
+        context_parts = []
+        for i, node in enumerate(nodes, 1):
+            # Get node text and metadata
+            text = node.node.text
+            score = node.score if hasattr(node, 'score') else None
+            
+            # Format with score if available
+            if score:
+                context_parts.append(f"[Result {i} - Relevance: {score:.2f}]\n{text}")
+            else:
+                context_parts.append(f"[Result {i}]\n{text}")
+        
+        context = "\n\n---\n\n".join(context_parts)
+        
+        logger.info("rag_search_success", 
+                   business_id=business_id, 
+                   results_count=len(nodes),
+                   query_length=len(search_query),
+                   context_length=len(context))
         
         return {
             "messages": [{
@@ -1263,14 +1442,19 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
         }
     
     except Exception as e:
-        logger.error("rag_search_failed", business_id=business_id, error=str(e))
+        logger.error("rag_search_unexpected_error", 
+                    business_id=business_id, 
+                    error=str(e),
+                    error_type=type(e).__name__)
         return {
             "messages": [{
                 "role": "tool",
-                "content": "Sorry, I encountered an error searching the knowledge base. Please try again.",
+                "content": "Sorry, I encountered an unexpected error searching the knowledge base. Please try again or contact support if the issue persists.",
                 "tool_call_id": tool_call['id']
             }]
         }
+
+
     
     
 # ============================================
