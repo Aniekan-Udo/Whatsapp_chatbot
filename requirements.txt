@@ -23,6 +23,7 @@ llama-index-core
 llama-index-vector-stores-postgres
 llama-index-embeddings-ollama
 #llama-index-embeddings-fastembed
+llama_index.embeddings.fastembed
 # Caching & Performance
 cashews[redis]
 aiocache[redis]
