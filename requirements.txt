@@ -23,7 +23,9 @@ llama-index-core
 llama-index-vector-stores-postgres
 llama-index-embeddings-ollama
 #llama-index-embeddings-fastembed
-llama_index.embeddings.fastembed
+llama-index-embeddings-huggingface  # ✅ Changed from fastembed
+sentence-transformers  # ✅ Required for HuggingFace embeddings
+torch 
 # Caching & Performance
 cashews[redis]
 aiocache[redis]
