@@ -1,3 +1,4 @@
+os
 # Core Framework
 langchain-core
 langchain-community
@@ -26,6 +27,7 @@ llama-index-embeddings-ollama
 llama-index-embeddings-huggingface  # ✅ Changed from fastembed
 sentence-transformers  # ✅ Required for HuggingFace embeddings
 torch 
+
 # Caching & Performance
 cashews[redis]
 aiocache[redis]
@@ -43,15 +45,17 @@ tenacity
 structlog
 prometheus-client
 
-# OpenTelemetry
-opentelemetry-api
-opentelemetry-sdk
-opentelemetry-instrumentation-fastapi
-opentelemetry-instrumentation-asyncpg
-opentelemetry-instrumentation-sqlalchemy
-opentelemetry-instrumentation-psycopg
-opentelemetry-exporter-otlp-proto-grpc
-opentelemetry-exporter-prometheus
+# OpenTelemetry (UPDATED & VERSION-ALIGNED)
+opentelemetry-api==1.38.0
+opentelemetry-sdk==1.38.0
+opentelemetry-semantic-conventions==0.59b0
+opentelemetry-instrumentation==0.59b0
+opentelemetry-instrumentation-fastapi==0.59b0
+opentelemetry-instrumentation-asyncpg==0.59b0
+opentelemetry-instrumentation-sqlalchemy==0.59b0
+opentelemetry-instrumentation-psycopg==0.59b0
+opentelemetry-exporter-otlp-proto-grpc==1.38.0
+opentelemetry-exporter-prometheus==0.59b0
 
 # Data Processing
 pandas

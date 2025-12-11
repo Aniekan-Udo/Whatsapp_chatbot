@@ -1,17 +1,13 @@
 import sys
 import asyncio
-import asyncpg
-
-if sys.platform == "win32":
+import os
+if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
 
 from monitoring import setup_monitoring, monitor
 
+
+import psycopg.errors as psycopg_errors
 import uuid
 from typing import List, Optional, Dict, Any
 import pandas as pd
@@ -126,21 +122,25 @@ logger = structlog.get_logger()
 # ============================================
 # LLAMAINDEX CONFIGURATION
 # ============================================
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+#from llama_index.embeddings import HuggingFaceEmbeddings
 from llama_index.core import Settings
 from cashews import cache
 import os
 
-# Configure embeddings
-Settings.embed_model = HuggingFaceEmbedding(
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+embed_model = HuggingFaceEmbedding(
     model_name="BAAI/bge-small-en-v1.5",
-    cache_folder=os.getenv("MODEL_CACHE_DIR", "./model_cache"),
-    embed_batch_size=10,  # Process in batches for efficiency
+    cache_folder="./model_cache",
+    embed_batch_size=10,
     max_length=512
 )
 
+# Assign to LlamaIndex settings
+Settings.embed_model = embed_model
 # Set other settings
-Settings.llm = None  # You're using Groq separately
+Settings.llm = None 
 Settings.chunk_size = 512
 Settings.chunk_overlap = 50
 
@@ -317,8 +317,7 @@ profile_extractor = create_extractor(
 
 WHATSAPP_CHATBOT_EXCEPTIONS = (
     ConnectionError,
-    asyncpg.PostgresError,
-    asyncpg.InterfaceError,
+    psycopg_errors.Error,       
     TimeoutError,
     ValueError,
     IndexError,
@@ -548,8 +547,7 @@ async def register_business_document(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=5),
     retry=retry_if_exception_type((
-        asyncpg.PostgresError,
-        asyncpg.InterfaceError,
+        psycopg_errors.Error,
         ConnectionError,
     )),
     reraise=True
@@ -651,8 +649,7 @@ logger.info("cache_initialized", backend="memory")
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
     retry=retry_if_exception_type((
-        asyncpg.PostgresError,
-        asyncpg.InterfaceError,
+        psycopg_errors.Error,
         ConnectionError,
         TimeoutError,
         FileNotFoundError,
@@ -760,11 +757,11 @@ async def initialize_rag(
     # Create vector store with DIRECT connection (not pooler for long operations)
     try:
         vector_store = PGVectorStore.from_params(
-            connection_string=POSTGRES_URI_DIRECT,  # Use direct for indexing
+            connection_string=POSTGRES_URI,  # Use direct for indexing
             table_name=collection_name,
             embed_dim=384,
-            hybrid_search=False,  # Disabled to avoid int conversion issues
-            perform_setup=True,  # Create table and indexes
+            hybrid_search=False, 
+            perform_setup=True,  
             hnsw_kwargs={
                 "hnsw_m": 16,
                 "hnsw_ef_construction": 64,
@@ -817,41 +814,34 @@ async def initialize_rag(
         "document_count": len(documents)
     }
             
-
 # ============================================
 # LANGGRAPH NODES
 # ============================================
 
-@cache.circuit_breaker(
-    errors_rate=10,
-    period="10m",
-    ttl="5m",
-    min_calls=5
-)
+# ============================================
+# SIMPLIFIED GROQ API CALL
+# ============================================
+
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),  # Exponential backoff
+    wait=wait_exponential(multiplier=1, min=1, max=10),
     retry=retry_if_exception_type((
         ConnectionError,
         TimeoutError,
         asyncio.TimeoutError,
-    )),  # Only retry transient errors
+    )),
     reraise=True
 )
 @cache(ttl="2m")
 @monitor(model="llama-3.3-70b", track_tokens=True)
 async def call_groq_api(messages: list, tools: list = None):
     """
-    EXTERNAL API - NEEDS RETRY + CIRCUIT BREAKER
+    Call Groq API with retry and caching.
     
-    Why retry?
-    - Network hiccups (transient)
-    - Temporary rate limits
-    - API momentary unavailability
-    
-    Why circuit breaker?
-    - Stop retrying if service is down (not transient)
-    - Fail fast after threshold reached
+    Retry strategy:
+    - 3 attempts with exponential backoff
+    - Only retry transient network errors
+    - Cache successful responses for 2 minutes
     """
     try:
         logger.info("groq_api_call_started")
@@ -865,14 +855,15 @@ async def call_groq_api(messages: list, tools: list = None):
         return response
         
     except Exception as e:
-        logger.error("groq_api_call_failed", error=str(e), error_type=type(e).__name__)
+        logger.error("groq_api_call_failed", 
+                    error=str(e), 
+                    error_type=type(e).__name__)
         raise
+
 
 @monitor(operation="chatbot")
 async def chatbot(state: MessagesState, config: RunnableConfig):
-    """
-    🟡 Use circuit-breaker-protected API call.
-    """
+    """Main chatbot logic with graceful error handling."""
     global store
     
     user_id = config["configurable"]["user_id"]
@@ -890,29 +881,29 @@ async def chatbot(state: MessagesState, config: RunnableConfig):
     system_msg = MSG_PROMPT.format(user_profile=existing_memory_content)
     
     try:
-        #
         response = await call_groq_api(
             [SystemMessage(content=system_msg)] + state["messages"],
             tools=[CustomerAction]
         )
         return {"messages": [response]}
         
-    except CircuitBreakerOpen:
-        logger.warning("circuit_breaker_open", business_id=business_id)
-        # Return fallback response
+    except Exception as e:
+        # After all retries failed
+        logger.error("chatbot_api_failure", 
+                    business_id=business_id,
+                    error=str(e))
+        
+        # Return graceful fallback
         return {
-            "messages": [AIMessage(content="I'm experiencing high traffic right now. Please try again in a moment.")]
+            "messages": [AIMessage(
+                content="I'm having trouble connecting right now. Please try again in a moment or contact support if this continues."
+            )]
         }
 
-@monitor(operation="write_memory")       
+
+@monitor(operation="write_memory")
 async def write_memory(state: MessagesState, config: RunnableConfig):
-    """
-    PROFILE UPDATE - SELECTIVE RETRY
-    
-    Retry strategy:
-    - DON'T retry API call (handled by circuit breaker)
-    - DO retry database save (transient errors)
-    """
+    """Update user profile with graceful error handling."""
     global store
     
     user_id = config["configurable"]["user_id"]
@@ -932,50 +923,57 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
         if not (hasattr(msg, 'type') and msg.type == 'tool')
     ]
     
-    TRUSTCALL_INSTRUCTION_FORMATTED = TRUSTCALL_INSTRUCTION.format(memory=existing_memories)
+    TRUSTCALL_INSTRUCTION_FORMATTED = TRUSTCALL_INSTRUCTION.format(
+        memory=existing_memories
+    )
     updated_messages = list(merge_message_runs(
         [SystemMessage(content=TRUSTCALL_INSTRUCTION_FORMATTED)] + conversation_history
     ))
     
     try:
-        # 🔵 API call - circuit breaker handles retries internally
+        # API call with built-in retry
         result = await profile_extractor.ainvoke({
             "messages": updated_messages,
             "existing": existing_memories
         })
         
-    except CircuitBreakerOpen:
-        logger.warning("profile_extraction_circuit_open", business_id=business_id)
+    except Exception as e:
+        logger.error("profile_extraction_failed", 
+                    business_id=business_id,
+                    error=str(e))
+        
         tool_calls = state['messages'][-1].tool_calls
         return {
             "messages": [{
                 "role": "tool",
-                "content": "Profile update temporarily unavailable. Your information will be saved on the next interaction.",
+                "content": "Profile update temporarily unavailable. Your information will be saved on your next interaction.",
                 "tool_call_id": tool_calls[0]['id']
             }]
         }
     
     profile_data: Profile = result['responses'][0]
     
-    logger.info("profile_extracted", business_id=business_id, user_id=user_id, has_name=profile_data.name is not None)
+    logger.info("profile_extracted", 
+               business_id=business_id, 
+               user_id=user_id, 
+               has_name=profile_data.name is not None)
     
-    # Save to LangGraph store (has its own retry internally)
+    # Save to LangGraph store
     for r, rmeta in zip(result["responses"], result["response_metadata"]):
         await store.aput(namespace, "user_memory", r.model_dump(mode="json"))
     
-    # Database save - add retry wrapper
+    # Database save with dedicated retry
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=5),
         retry=retry_if_exception_type((
-            asyncpg.PostgresError,
-            asyncpg.InterfaceError,
+            psycopg_errors.Error,
             ConnectionError,
         )),
         reraise=True
     )
     async def save_profile_to_db():
-        """Inner function with retry for database save."""
+        """Database save with retry for transient failures."""
         async with async_session_factory() as session:
             profile = await session.get(UserProfile, (business_id, user_id))
             
@@ -983,7 +981,7 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
                 profile = UserProfile(business_id=business_id, user_id=user_id)
                 session.add(profile)
             
-            # Update fields
+            # Update fields only if provided
             if profile_data.name is not None:
                 profile.name = profile_data.name
             if profile_data.location is not None:
@@ -999,10 +997,14 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
             
             await session.commit()
     
-    # Execute with retry
-    await save_profile_to_db()
-    
-    logger.info("profile_saved", business_id=business_id, user_id=user_id)
+    try:
+        await save_profile_to_db()
+        logger.info("profile_saved", business_id=business_id, user_id=user_id)
+    except Exception as db_error:
+        logger.error("profile_db_save_failed",
+                    business_id=business_id,
+                    error=str(db_error))
+        # Continue anyway - profile was saved to store
     
     tool_calls = state['messages'][-1].tool_calls
     return {
@@ -1460,10 +1462,7 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
                 "content": "Sorry, I encountered an unexpected error searching the knowledge base. Please try again or contact support if the issue persists.",
                 "tool_call_id": tool_call['id']
             }]
-        }
-
-
-    
+        }    
     
 # ============================================
 # ROUTING

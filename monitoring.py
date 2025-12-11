@@ -2,6 +2,19 @@
 Comprehensive monitoring setup with Prometheus and OpenTelemetry
 """
 
+# ============================================
+# CRITICAL: Windows Event Loop Fix - MUST BE FIRST
+# ============================================
+import sys
+import asyncio
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# ============================================
+# NOW SAFE TO IMPORT OTHER MODULES
+# ============================================
+
 import os
 import time
 import functools
@@ -28,7 +41,6 @@ from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 
 # OpenTelemetry - Auto-instrumentation
-
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
 try:
@@ -296,6 +308,7 @@ def setup_auto_instrumentation(
 # ============================================
 
 def setup_monitoring(
+    app=None,
     prometheus_port: int = 9090,
     otlp_endpoint: Optional[str] = None,
     service_name: str = "whatsapp-chatbot",
@@ -307,7 +320,8 @@ def setup_monitoring(
     Setup complete monitoring with Prometheus and OpenTelemetry
     
     Args:
-        prometheus_port: Port for Prometheus metrics server
+        app: FastAPI app instance (for instrumentation)
+        prometheus_port: Port for Prometheus metrics server (or FastAPI app object)
         otlp_endpoint: OTLP endpoint for traces/metrics (e.g., "http://localhost:4317")
         service_name: Service name for tracing
         service_version: Service version
@@ -316,6 +330,7 @@ def setup_monitoring(
     
     Example:
         setup_monitoring(
+            app=app,
             prometheus_port=9090,
             otlp_endpoint=os.getenv("OTLP_ENDPOINT", "http://localhost:4317"),
             environment="production"
@@ -341,8 +356,13 @@ def setup_monitoring(
     # ============================================
     
     try:
-        start_http_server(prometheus_port)
-        logger.info("prometheus_metrics_server_started", port=prometheus_port)
+        # Check if prometheus_port is actually an int
+        if isinstance(prometheus_port, int):
+            start_http_server(prometheus_port)
+            logger.info("prometheus_metrics_server_started", port=prometheus_port)
+        else:
+            logger.warning("prometheus_port_invalid", 
+                          prometheus_port=str(type(prometheus_port)))
         
         # Set application info
         app_info.info({
@@ -506,7 +526,6 @@ def monitor(
                         db_operations_total.labels(operation=op_name, status=status).inc()
         
         # Return appropriate wrapper based on function type
-        import asyncio
         if asyncio.iscoroutinefunction(func):
             return async_wrapper
         else:
