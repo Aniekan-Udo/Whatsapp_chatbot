@@ -126,15 +126,23 @@ logger = structlog.get_logger()
 # ============================================
 # LLAMAINDEX CONFIGURATION
 # ============================================
-from llama_index.embeddings.ollama import OllamaEmbedding
-from llama_index.embeddings.fastembed import FastEmbedEmbedding
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core import Settings
-from cashews import CircuitBreakerOpen, RateLimitError, cache
+from cashews import cache
+import os
 
-Settings.embed_model = FastEmbedEmbedding(
+# Configure embeddings
+Settings.embed_model = HuggingFaceEmbedding(
     model_name="BAAI/bge-small-en-v1.5",
+    cache_folder=os.getenv("MODEL_CACHE_DIR", "./model_cache"),
+    embed_batch_size=10,  # Process in batches for efficiency
     max_length=512
 )
+
+# Set other settings
+Settings.llm = None  # You're using Groq separately
+Settings.chunk_size = 512
+Settings.chunk_overlap = 50
 
 
 # ============================================
