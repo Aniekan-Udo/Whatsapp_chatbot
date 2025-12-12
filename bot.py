@@ -105,20 +105,20 @@ print(f"POSTGRES_URI_POOLER: {POSTGRES_URI_POOLER.split('@')[0]}@...")
 # STRUCTURED LOGGING SETUP
 # ============================================
 
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        JSONRenderer()
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO level
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
-)
+# structlog.configure(
+#     processors=[
+#         structlog.contextvars.merge_contextvars,
+#         structlog.processors.add_log_level,
+#         structlog.processors.TimeStamper(fmt="iso"),
+#         JSONRenderer()
+#     ],
+#     wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO level
+#     context_class=dict,
+#     logger_factory=structlog.PrintLoggerFactory(),
+# )
 
-logger = structlog.get_logger()
-
+# logger = structlog.get_logger()
+from monitoring import logger
 # ============================================
 # LLAMAINDEX CONFIGURATION
 # ============================================
