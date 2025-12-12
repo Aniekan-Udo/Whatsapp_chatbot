@@ -129,16 +129,31 @@ from cashews import cache
 import os
 
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.core import Settings
 
-embed_model = HuggingFaceEmbedding(
-    model_name="BAAI/bge-small-en-v1.5",
-    cache_folder="./model_cache",
-    embed_batch_size=10,
-    max_length=512
-)
+# Don't initialize model at import time - make it lazy
+_embed_model = None
 
-# Assign to LlamaIndex settings
-Settings.embed_model = embed_model
+def get_embed_model():
+    """Lazy load embedding model"""
+    global _embed_model
+    if _embed_model is None:
+        logger.info("initializing_embedding_model")
+        _embed_model = HuggingFaceEmbedding(
+            model_name="BAAI/bge-small-en-v1.5",
+            cache_folder="./model_cache",
+            embed_batch_size=10,
+            max_length=512
+        )
+        logger.info("embedding_model_initialized")
+    return _embed_model
+
+# Configure Settings to use lazy getter
+Settings.llm = None 
+Settings.chunk_size = 512
+Settings.chunk_overlap = 50
+
+
 # Set other settings
 Settings.llm = None 
 Settings.chunk_size = 512
@@ -680,6 +695,8 @@ async def initialize_rag(
     Returns:
         Dict with collection_name and status
     """
+    
+    Settings.embed_model = get_embed_model()
     
     if not business_id:
         raise ValueError("business_id is required")

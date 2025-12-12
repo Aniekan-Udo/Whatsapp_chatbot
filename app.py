@@ -149,73 +149,25 @@ async def get_or_create_graph():
         return _graph_instance
 
 # ============================================
-# BACKGROUND INITIALIZATION (NON-BLOCKING)
-# ============================================
-
-async def background_init():
-    """Initialize RAG systems in background - non-blocking"""
-    try:
-        # Wait a bit to let the app start serving requests first
-        await asyncio.sleep(5)
-        
-        logger.info("background_init_started")
-        
-        # Ensure database is ready
-        await ensure_database_initialized()
-        
-        # Get active businesses
-        async with async_session_factory() as session:
-            result = await session.execute(
-                select(distinct(BusinessDocument.business_id)).where(
-                    BusinessDocument.status == 'active'
-                )
-            )
-            businesses = [row[0] for row in result.fetchall()]
-        
-        logger.info("background_init_businesses_found", count=len(businesses))
-        
-        # Initialize RAG for each business
-        for business_id in businesses:
-            try:
-                logger.info("background_rag_init_started", business_id=business_id)
-                await initialize_rag(business_id=business_id)
-                logger.info("background_rag_init_completed", business_id=business_id)
-            except Exception as e:
-                logger.error("background_rag_init_failed", 
-                           business_id=business_id, 
-                           error=str(e))
-        
-        logger.info("background_init_completed")
-        
-    except Exception as e:
-        logger.error("background_init_critical_failure", error=str(e), exc_info=True)
-    finally:
-        current_task = asyncio.current_task()
-        if current_task:
-            background_tasks.discard(current_task)
-
-# ============================================
 # LIFESPAN MANAGEMENT (ULTRA-FAST STARTUP)
 # ============================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Ultra-fast startup - initialize on-demand only"""
+    """Ultra-fast startup - NO blocking initialization"""
     try:
         logger.info("application_startup_initiated", 
                    platform=sys.platform)
         
-        # Minimal startup - just set ready flag
+        # ONLY set ready flag - NOTHING ELSE
         app.state.ready = True
         app.state.background_tasks = background_tasks
         
         logger.info("application_startup_completed_fast_path", 
-                   message="Database and graph will initialize on first use")
+                   message="Server ready. Database and graph initialize on first use.")
         
-        # Schedule background initialization (non-blocking)
-        task = asyncio.create_task(background_init())
-        background_tasks.add(task)
-        task.add_done_callback(lambda t: background_tasks.discard(t))
+        # DON'T schedule any background tasks here - they block startup
+        # Let initialization happen on first actual request
         
         yield
         
@@ -301,15 +253,15 @@ async def add_request_id(request: Request, call_next):
         contextvars.unbind_contextvars("request_id")
 
 # ============================================
-# HEALTH CHECK (INSTANT RESPONSE)
+# HEALTH CHECKS - MUST BE FIRST (BEFORE OTHER ROUTES)
 # ============================================
 
-@app.get("/ping", tags=["Health"])
+@app.get("/ping")
 async def ping():
-    """Ultra-fast ping endpoint - no checks, instant response"""
+    """Ultra-fast ping endpoint - instant response, no dependencies"""
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
-@app.get("/health", response_model=HealthResponse, tags=["Health"])
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Basic health check - minimal overhead"""
     health = {
@@ -326,7 +278,7 @@ async def health_check():
     
     return health
 
-@app.get("/readiness", tags=["Health"])
+@app.get("/readiness")
 async def readiness_check():
     """Detailed readiness check - triggers lazy initialization if needed"""
     try:
@@ -348,17 +300,39 @@ async def readiness_check():
     }
 
 # ============================================
+# ROOT ENDPOINT
+# ============================================
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "name": "WhatsApp Chatbot API",
+        "version": "1.0.0",
+        "status": "running" if app.state.ready else "starting",
+        "message": "Fast startup enabled - components initialize on first use",
+        "endpoints": {
+            "ping": "/ping (instant response)",
+            "health": "/health (basic check)",
+            "readiness": "/readiness (full check)",
+            "docs": "/docs",
+            "chat": "/chat",
+            "upload": "/documents/upload"
+        }
+    }
+
+# ============================================
 # CHAT ENDPOINTS
 # ============================================
 
-@app.post("/chat", response_model=ChatResponse, tags=["Chat"])
+@app.post("/chat", response_model=ChatResponse)
 @limiter.limit("60/minute")
 async def chat(request: Request, chat_request: ChatRequest):
     """Send a message to the chatbot"""
     if not app.state.ready:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Service not ready. Please try again."
+            detail="Service not ready. Please try again in a moment."
         )
     
     try:
@@ -428,7 +402,7 @@ async def chat(request: Request, chat_request: ChatRequest):
 # DOCUMENT MANAGEMENT
 # ============================================
 
-@app.post("/documents/upload", response_model=DocumentResponse, tags=["Documents"])
+@app.post("/documents/upload", response_model=DocumentResponse)
 async def upload_document(
     business_id: str = Form(...),
     file: UploadFile = File(...),
@@ -506,8 +480,9 @@ async def upload_document(
             }
         )
         
-        logger.info("file_uploaded_successfully", business_id=business_id)
+        logger.info("document_registered_successfully", business_id=business_id)
         
+        # Return success (200, not 202)
         return DocumentResponse(
             business_id=business_id,
             document_path=str(file_path),
@@ -516,24 +491,26 @@ async def upload_document(
         )
         
     except Exception as e:
-        # Cleanup
+        # Cleanup file on error
         if file_path and await asyncio.to_thread(file_path.exists):
             try:
                 await asyncio.to_thread(file_path.unlink)
-            except:
-                pass
+                logger.info("cleanup_deleted_file", path=str(file_path))
+            except Exception as cleanup_error:
+                logger.warning("cleanup_failed", error=str(cleanup_error))
         
         logger.error("file_upload_failed", 
                     business_id=business_id, 
-                    error=str(e))
+                    error=str(e),
+                    error_type=type(e).__name__)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to upload file"
+            detail=f"Failed to upload file: {str(e)}"
         )
     finally:
         await file.close()
 
-@app.get("/documents/{business_id}", response_model=DocumentResponse, tags=["Documents"])
+@app.get("/documents/{business_id}", response_model=DocumentResponse)
 async def get_document(business_id: str):
     """Get registered document for a business"""
     try:
@@ -564,7 +541,7 @@ async def get_document(business_id: str):
             detail="Failed to retrieve document"
         )
 
-@app.delete("/documents/{business_id}", tags=["Documents"])
+@app.delete("/documents/{business_id}")
 async def delete_document(business_id: str, delete_file: bool = False):
     """Delete/deactivate a business document"""
     try:
@@ -613,8 +590,8 @@ async def delete_document(business_id: str, delete_file: bool = False):
             from cashews import cache
             await cache.delete(f"rag:{business_id}")
             logger.info("rag_cache_cleared", business_id=business_id)
-        except:
-            pass
+        except Exception as cache_error:
+            logger.warning("cache_clear_failed", error=str(cache_error))
         
         return {
             "status": "deleted",
@@ -632,26 +609,49 @@ async def delete_document(business_id: str, delete_file: bool = False):
         )
 
 # ============================================
-# ROOT ENDPOINT
+# ADMIN ENDPOINTS
 # ============================================
 
-@app.get("/", tags=["Root"])
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "name": "WhatsApp Chatbot API",
-        "version": "1.0.0",
-        "status": "running" if app.state.ready else "starting",
-        "message": "Fast startup enabled - components initialize on first use",
-        "endpoints": {
-            "ping": "/ping",
-            "health": "/health",
-            "readiness": "/readiness",
-            "docs": "/docs",
-            "chat": "/chat",
-            "upload": "/documents/upload"
+@app.post("/admin/initialize-rag/{business_id}")
+async def admin_initialize_rag(business_id: str, force: bool = False):
+    """Manually trigger RAG initialization for a business"""
+    try:
+        await ensure_database_initialized()
+        
+        logger.info("admin_rag_init_requested", business_id=business_id, force=force)
+        
+        # Get document path
+        doc_path = await get_business_document(business_id)
+        if not doc_path:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No document found for business_id: {business_id}"
+            )
+        
+        # Initialize RAG
+        result = await initialize_rag(
+            business_id=business_id,
+            doc_path=doc_path,
+            force_reinit=force
+        )
+        
+        return {
+            "status": "success",
+            "business_id": business_id,
+            "result": result,
+            "message": "RAG initialized successfully"
         }
-    }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("admin_rag_init_failed", 
+                    business_id=business_id, 
+                    error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to initialize RAG: {str(e)}"
+        )
 
 # ============================================
 # ERROR HANDLERS
@@ -680,6 +680,13 @@ if __name__ == "__main__":
     
     port = int(os.getenv("PORT", 8001))
     
+    # Print port binding info for deployment platforms
+    print("=" * 60)
+    print(f"🚀 BINDING TO PORT: {port}")
+    print(f"🌐 HOST: 0.0.0.0")
+    print(f"📍 Health check: http://0.0.0.0:{port}/ping")
+    print("=" * 60)
+    
     logger.info("starting_uvicorn_server", 
                host="0.0.0.0", 
                port=port)
@@ -688,5 +695,6 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=port,
-        log_level="info"
+        log_level="info",
+        timeout_keep_alive=65
     )
