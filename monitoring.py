@@ -9,8 +9,21 @@ try:
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
+import structlog
+from structlog.processors import JSONRenderer
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        JSONRenderer()
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO level
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),
+)
 
-from bot import logger
+logger = structlog.get_logger()
 
 # Lazy metrics - only create if Prometheus is available
 if PROMETHEUS_AVAILABLE:
