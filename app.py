@@ -4,14 +4,13 @@ import sys
 # Fix for Windows + psycopg async - ONLY apply on Windows
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-# On Linux (Render), use default asyncio event loop policy (no changes needed)
 
 import os
 import re
 import time
 import uuid
 import aiofiles
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, Set
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime
@@ -50,6 +49,7 @@ from bot import (
 )
 
 from monitoring import setup_monitoring
+
 # ============================================
 # CONFIGURATION
 # ============================================
@@ -93,13 +93,9 @@ class HealthResponse(BaseModel):
 
 def sanitize_filename(filename: str) -> str:
     """Sanitize filename to prevent path traversal attacks."""
-    # Remove path components
     filename = Path(filename).name
-    # Remove dangerous characters (keep only alphanumeric, spaces, dots, dashes, underscores)
     filename = re.sub(r'[^\w\s.-]', '', filename)
-    # Remove any remaining path separators that might have slipped through
     filename = filename.replace('/', '').replace('\\', '')
-    # Limit length
     return filename[:200]
 
 # ============================================
@@ -108,18 +104,66 @@ def sanitize_filename(filename: str) -> str:
 
 background_tasks: Set[asyncio.Task] = set()
 
+# Lazy initialization flags
+_db_initialized = False
+_graph_instance = None
+_initialization_lock = asyncio.Lock()
+
 # ============================================
-# BACKGROUND INITIALIZATION
+# LAZY INITIALIZATION FUNCTIONS
+# ============================================
+
+async def ensure_database_initialized():
+    """Initialize database only when first needed"""
+    global _db_initialized
+    
+    if _db_initialized:
+        return
+    
+    async with _initialization_lock:
+        # Double-check after acquiring lock
+        if _db_initialized:
+            return
+        
+        logger.info("lazy_database_initialization_started")
+        await setup_database()
+        _db_initialized = True
+        logger.info("lazy_database_initialization_completed")
+
+async def get_or_create_graph():
+    """Get graph instance, initializing only if needed"""
+    global _graph_instance
+    
+    if _graph_instance is not None:
+        return _graph_instance
+    
+    async with _initialization_lock:
+        # Double-check after acquiring lock
+        if _graph_instance is not None:
+            return _graph_instance
+        
+        logger.info("lazy_graph_initialization_started")
+        await ensure_database_initialized()
+        _graph_instance = await initialize_graph()
+        logger.info("lazy_graph_initialization_completed")
+        return _graph_instance
+
+# ============================================
+# BACKGROUND INITIALIZATION (NON-BLOCKING)
 # ============================================
 
 async def background_init():
-    """Initialize RAG systems in background after startup."""
+    """Initialize RAG systems in background - non-blocking"""
     try:
-        await asyncio.sleep(10)  # Wait for app to be ready
+        # Wait a bit to let the app start serving requests first
+        await asyncio.sleep(5)
         
         logger.info("background_init_started")
         
-        # Get active businesses using SQLAlchemy ORM (not raw SQL)
+        # Ensure database is ready
+        await ensure_database_initialized()
+        
+        # Get active businesses
         async with async_session_factory() as session:
             result = await session.execute(
                 select(distinct(BusinessDocument.business_id)).where(
@@ -146,85 +190,48 @@ async def background_init():
     except Exception as e:
         logger.error("background_init_critical_failure", error=str(e), exc_info=True)
     finally:
-        # Cleanup task reference
         current_task = asyncio.current_task()
         if current_task:
             background_tasks.discard(current_task)
 
 # ============================================
-# LIFESPAN MANAGEMENT
+# LIFESPAN MANAGEMENT (ULTRA-FAST STARTUP)
 # ============================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown events - optimized for faster cold starts"""
+    """Ultra-fast startup - initialize on-demand only"""
     try:
         logger.info("application_startup_initiated", 
-                   platform=sys.platform,
-                   python_version=sys.version)
+                   platform=sys.platform)
         
-        # Set ready early so health checks pass
+        # Minimal startup - just set ready flag
         app.state.ready = True
         app.state.background_tasks = background_tasks
         
-        # Initialize monitoring (fast)
-        logger.info("initializing_monitoring")
-        setup_monitoring(app)
-        logger.info("monitoring_initialized")
+        logger.info("application_startup_completed_fast_path", 
+                   message="Database and graph will initialize on first use")
         
-        # Initialize database in background to speed up startup
-        async def init_database_background():
-            try:
-                logger.info("initializing_database")
-                await setup_database()
-                logger.info("database_initialized")
-                
-                # Initialize graph
-                logger.info("initializing_graph")
-                app.state.graph = await initialize_graph()
-                logger.info("graph_initialized")
-                
-                logger.info("application_startup_completed", status="READY")
-                
-                # Start background RAG initialization
-                rag_task = asyncio.create_task(background_init())
-                background_tasks.add(rag_task)
-                rag_task.add_done_callback(lambda t: background_tasks.discard(t))
-                logger.info("background_init_scheduled")
-                
-            except Exception as e:
-                logger.error("background_initialization_failed", error=str(e))
-                app.state.ready = False
-        
-        # Start database init in background
-        db_task = asyncio.create_task(init_database_background())
-        background_tasks.add(db_task)
-        db_task.add_done_callback(lambda t: background_tasks.discard(t))
-        
-        # Initialize graph as None (will be set by background task)
-        app.state.graph = None
-        
-        logger.info("application_startup_fast_path_completed")
+        # Schedule background initialization (non-blocking)
+        task = asyncio.create_task(background_init())
+        background_tasks.add(task)
+        task.add_done_callback(lambda t: background_tasks.discard(t))
         
         yield
         
     except Exception as e:
-        logger.error("application_startup_failed", 
-                    error=str(e), 
-                    error_type=type(e).__name__,
-                    exc_info=True)
+        logger.error("application_startup_failed", error=str(e), exc_info=True)
         raise
     finally:
         # Shutdown
         logger.info("application_shutdown_initiated")
         app.state.ready = False
         
-        # Cancel and cleanup background tasks
+        # Cancel background tasks
         for task in list(background_tasks):
             if not task.done():
                 task.cancel()
         
-        # Wait for tasks to complete with timeout
         if background_tasks:
             try:
                 await asyncio.wait_for(
@@ -234,16 +241,16 @@ async def lifespan(app: FastAPI):
             except asyncio.TimeoutError:
                 logger.warning("background_tasks_shutdown_timeout")
         
-        # Close SQLAlchemy engine if it exists
-        try:
-            await engine.dispose()
-            logger.info("sqlalchemy_engine_closed")
-        except Exception as e:
-            logger.warning("engine_disposal_warning", error=str(e))
+        # Close engine if initialized
+        if _db_initialized:
+            try:
+                await engine.dispose()
+                logger.info("sqlalchemy_engine_closed")
+            except Exception as e:
+                logger.warning("engine_disposal_warning", error=str(e))
         
         logger.info("application_shutdown_completed")
 
-        
 # ============================================
 # FASTAPI APP
 # ============================================
@@ -255,11 +262,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware - use environment variable for origins
+# CORS middleware
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*")
 if allowed_origins == "*":
-    logger.warning("cors_all_origins_enabled", 
-                  message="Using wildcard CORS - not recommended for production")
+    logger.warning("cors_all_origins_enabled")
 
 app.add_middleware(
     CORSMiddleware,
@@ -292,20 +298,24 @@ async def add_request_id(request: Request, call_next):
         response.headers["X-Request-ID"] = request_id
         return response
     finally:
-        # Always cleanup, even if error occurs
         contextvars.unbind_contextvars("request_id")
 
 # ============================================
-# HEALTH CHECK
+# HEALTH CHECK (INSTANT RESPONSE)
 # ============================================
+
+@app.get("/ping", tags=["Health"])
+async def ping():
+    """Ultra-fast ping endpoint - no checks, instant response"""
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
-    """Simple health check - returns immediately"""
+    """Basic health check - minimal overhead"""
     health = {
         "status": "healthy" if app.state.ready else "starting",
-        "database": "connected" if (store and saver) else "disconnected",
-        "graph": "initialized" if app.state.graph else "not_initialized"
+        "database": "initialized" if _db_initialized else "lazy",
+        "graph": "initialized" if _graph_instance else "lazy"
     }
     
     if not app.state.ready:
@@ -318,9 +328,12 @@ async def health_check():
 
 @app.get("/readiness", tags=["Health"])
 async def readiness_check():
-    """Detailed readiness check"""
+    """Detailed readiness check - triggers lazy initialization if needed"""
     try:
-        # Test database connection with proper SQLAlchemy select
+        # This will trigger lazy initialization
+        await ensure_database_initialized()
+        
+        # Quick DB test
         async with async_session_factory() as session:
             await session.execute(select(1))
         
@@ -328,13 +341,10 @@ async def readiness_check():
     except Exception as e:
         db_status = f"error: {str(e)[:100]}"
     
-    # Use app.state for atomic check
-    is_ready = app.state.ready and db_status == "ready"
-    
     return {
-        "status": "ready" if is_ready else "not_ready",
+        "status": "ready" if app.state.ready and db_status == "ready" else "not_ready",
         "database": db_status,
-        "graph": "initialized" if app.state.graph else "not_initialized"
+        "graph": "initialized" if _graph_instance else "will_initialize_on_first_use"
     }
 
 # ============================================
@@ -345,7 +355,7 @@ async def readiness_check():
 @limiter.limit("60/minute")
 async def chat(request: Request, chat_request: ChatRequest):
     """Send a message to the chatbot"""
-    if not app.state.ready or not app.state.graph:
+    if not app.state.ready:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Service not ready. Please try again."
@@ -355,8 +365,11 @@ async def chat(request: Request, chat_request: ChatRequest):
         logger.info(
             "chat_request_received",
             business_id=chat_request.business_id,
-            user_id_hash=hash(chat_request.user_id) % 10000  # Hash PII
+            user_id_hash=hash(chat_request.user_id) % 10000
         )
+        
+        # Lazy initialize graph on first chat request
+        graph = await get_or_create_graph()
         
         # Generate thread_id if not provided
         thread_id = chat_request.thread_id or f"{chat_request.business_id}_{chat_request.user_id}"
@@ -370,10 +383,10 @@ async def chat(request: Request, chat_request: ChatRequest):
             }
         }
         
-        # Invoke graph with timeout (using wait_for for better compatibility)
+        # Invoke graph with timeout
         input_message = {"messages": [HumanMessage(content=chat_request.message)]}
         result = await asyncio.wait_for(
-            app.state.graph.ainvoke(input_message, config),
+            graph.ainvoke(input_message, config),
             timeout=30.0
         )
         
@@ -408,7 +421,7 @@ async def chat(request: Request, chat_request: ChatRequest):
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to process message"
+            detail=f"Failed to process message: {str(e)}"
         )
 
 # ============================================
@@ -422,6 +435,9 @@ async def upload_document(
     document_name: Optional[str] = Form(None)
 ):
     """Upload a document file and register it for RAG"""
+    
+    # Ensure database is initialized
+    await ensure_database_initialized()
     
     # Validate file type
     file_ext = Path(file.filename).suffix.lower()
@@ -455,7 +471,7 @@ async def upload_document(
         business_dir = UPLOAD_DIR / business_id
         business_dir.mkdir(exist_ok=True)
         
-        # Sanitize filename to prevent path traversal attacks
+        # Sanitize filename
         safe_name = sanitize_filename(file.filename)
         safe_filename = f"{int(time.time())}_{safe_name}"
         file_path = business_dir / safe_filename
@@ -468,7 +484,7 @@ async def upload_document(
             file_size=file_size
         )
         
-        # Save file using async I/O
+        # Save file
         content = await file.read()
         async with aiofiles.open(file_path, "wb") as buffer:
             await buffer.write(content)
@@ -500,21 +516,16 @@ async def upload_document(
         )
         
     except Exception as e:
-        # Clean up file if registration fails (using async)
-        if file_path:
+        # Cleanup
+        if file_path and await asyncio.to_thread(file_path.exists):
             try:
-                if await asyncio.to_thread(file_path.exists):
-                    await asyncio.to_thread(file_path.unlink)
-                    logger.info("cleanup_file_deleted", path=str(file_path))
-            except Exception as cleanup_error:
-                logger.warning("file_cleanup_failed", 
-                             path=str(file_path), 
-                             error=str(cleanup_error))
+                await asyncio.to_thread(file_path.unlink)
+            except:
+                pass
         
         logger.error("file_upload_failed", 
                     business_id=business_id, 
-                    error=str(e),
-                    error_type=type(e).__name__)
+                    error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to upload file"
@@ -526,6 +537,7 @@ async def upload_document(
 async def get_document(business_id: str):
     """Get registered document for a business"""
     try:
+        await ensure_database_initialized()
         document_path = await get_business_document(business_id)
         
         if not document_path:
@@ -556,7 +568,8 @@ async def get_document(business_id: str):
 async def delete_document(business_id: str, delete_file: bool = False):
     """Delete/deactivate a business document"""
     try:
-        # Get document before deleting
+        await ensure_database_initialized()
+        
         doc_path = await get_business_document(business_id)
         
         if not doc_path:
@@ -565,7 +578,7 @@ async def delete_document(business_id: str, delete_file: bool = False):
                 detail=f"No document found for business_id: {business_id}"
             )
         
-        # Mark as inactive in database using SQLAlchemy ORM
+        # Mark as inactive
         async with async_session_factory() as session:
             result = await session.execute(
                 select(BusinessDocument).where(
@@ -580,33 +593,28 @@ async def delete_document(business_id: str, delete_file: bool = False):
                 await session.commit()
                 logger.info("document_marked_deleted", business_id=business_id)
         
-        # Optionally delete physical file (using async)
+        # Optionally delete physical file
         if delete_file:
             try:
                 if await asyncio.to_thread(os.path.exists, doc_path):
                     await asyncio.to_thread(os.remove, doc_path)
                     message = "Document deleted from database and file system"
-                    logger.info("document_file_deleted", business_id=business_id, path=doc_path)
+                    logger.info("document_file_deleted", business_id=business_id)
                 else:
                     message = "Document marked as deleted (file not found)"
             except Exception as file_error:
-                logger.error("document_file_deletion_failed", 
-                           business_id=business_id,
-                           error=str(file_error))
+                logger.error("document_file_deletion_failed", error=str(file_error))
                 message = "Document marked as deleted (file deletion failed)"
         else:
             message = "Document marked as deleted in database"
         
-        # Clear RAG cache with proper error handling
+        # Clear RAG cache
         try:
             from cashews import cache
             await cache.delete(f"rag:{business_id}")
             logger.info("rag_cache_cleared", business_id=business_id)
-        except Exception as cache_error:
-            logger.warning("cache_clear_failed", 
-                         business_id=business_id, 
-                         error=str(cache_error))
-            # Continue anyway - not critical
+        except:
+            pass
         
         return {
             "status": "deleted",
@@ -617,114 +625,11 @@ async def delete_document(business_id: str, delete_file: bool = False):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("document_deletion_failed", 
-                    business_id=business_id, 
-                    error=str(e))
+        logger.error("document_deletion_failed", error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete document"
         )
-
-# ============================================
-# ADMIN ENDPOINTS
-# ============================================
-
-@app.post("/admin/initialize-rag/{business_id}", tags=["Admin"])
-async def admin_initialize_rag(business_id: str, force_reinit: bool = False):
-    """Manually trigger RAG initialization for a business"""
-    try:
-        logger.info("manual_rag_init_started", 
-                   business_id=business_id,
-                   force_reinit=force_reinit)
-        
-        result = await initialize_rag(
-            business_id=business_id, 
-            force_reinit=force_reinit
-        )
-        
-        logger.info("manual_rag_init_completed", 
-                   business_id=business_id,
-                   result_status=result.get("status"))
-        
-        return {
-            "status": "success",
-            "business_id": business_id,
-            "result": result
-        }
-    except Exception as e:
-        logger.error("manual_rag_init_failed", 
-                    business_id=business_id, 
-                    error=str(e),
-                    error_type=type(e).__name__)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"RAG initialization failed: {str(e)}"
-        )
-
-@app.post("/admin/clear-cache", tags=["Admin"])
-async def clear_cache(business_id: Optional[str] = None):
-    """Clear application cache"""
-    try:
-        from cashews import cache
-        
-        if business_id:
-            # Clear specific business cache
-            await cache.delete(f"rag:{business_id}")
-            logger.info("cache_cleared_for_business", business_id=business_id)
-            message = f"Cache cleared for business {business_id}"
-        else:
-            # Clear all cache
-            await cache.clear()
-            logger.info("cache_cleared_all")
-            message = "All cache cleared"
-        
-        return {
-            "status": "success",
-            "message": message
-        }
-    except Exception as e:
-        logger.error("cache_clear_failed", error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to clear cache: {str(e)}"
-        )
-
-@app.get("/admin/background-tasks", tags=["Admin"])
-async def get_background_tasks():
-    """Get status of background tasks"""
-    tasks_info = []
-    for task in app.state.background_tasks:
-        tasks_info.append({
-            "done": task.done(),
-            "cancelled": task.cancelled(),
-        })
-    
-    return {
-        "total_tasks": len(app.state.background_tasks),
-        "tasks": tasks_info
-    }
-
-# ============================================
-# ERROR HANDLERS
-# ============================================
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    """Global exception handler"""
-    logger.error(
-        "unhandled_exception",
-        path=request.url.path,
-        method=request.method,
-        error=str(exc),
-        error_type=type(exc).__name__
-    )
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={
-            "detail": "Internal server error",
-            "type": type(exc).__name__
-        }
-    )
 
 # ============================================
 # ROOT ENDPOINT
@@ -737,21 +642,39 @@ async def root():
         "name": "WhatsApp Chatbot API",
         "version": "1.0.0",
         "status": "running" if app.state.ready else "starting",
+        "message": "Fast startup enabled - components initialize on first use",
         "endpoints": {
+            "ping": "/ping",
             "health": "/health",
             "readiness": "/readiness",
             "docs": "/docs",
             "chat": "/chat",
-            "upload": "/documents/upload",
-            "get_document": "/documents/{business_id}",
-            "delete_document": "/documents/{business_id}",
-            "admin": "/admin"
+            "upload": "/documents/upload"
         }
     }
 
 # ============================================
+# ERROR HANDLERS
+# ============================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler"""
+    logger.error(
+        "unhandled_exception",
+        path=request.url.path,
+        error=str(exc),
+        error_type=type(exc).__name__
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Internal server error"}
+    )
+
+# ============================================
 # RUN SERVER
 # ============================================
+
 if __name__ == "__main__":
     import uvicorn
     
@@ -762,7 +685,7 @@ if __name__ == "__main__":
                port=port)
     
     uvicorn.run(
-        app,  # Use app object directly
+        app,
         host="0.0.0.0",
         port=port,
         log_level="info"
