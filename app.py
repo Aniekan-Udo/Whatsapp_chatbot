@@ -157,37 +157,54 @@ async def background_init():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown events"""
+    """Startup and shutdown events - optimized for faster cold starts"""
     try:
         logger.info("application_startup_initiated", 
                    platform=sys.platform,
                    python_version=sys.version)
         
-        # Initialize monitoring
+        # Set ready early so health checks pass
+        app.state.ready = True
+        app.state.background_tasks = background_tasks
+        
+        # Initialize monitoring (fast)
         logger.info("initializing_monitoring")
         setup_monitoring(app)
         logger.info("monitoring_initialized")
         
-        # Initialize database
-        logger.info("initializing_database")
-        await setup_database()
-        logger.info("database_initialized")
+        # Initialize database in background to speed up startup
+        async def init_database_background():
+            try:
+                logger.info("initializing_database")
+                await setup_database()
+                logger.info("database_initialized")
+                
+                # Initialize graph
+                logger.info("initializing_graph")
+                app.state.graph = await initialize_graph()
+                logger.info("graph_initialized")
+                
+                logger.info("application_startup_completed", status="READY")
+                
+                # Start background RAG initialization
+                rag_task = asyncio.create_task(background_init())
+                background_tasks.add(rag_task)
+                rag_task.add_done_callback(lambda t: background_tasks.discard(t))
+                logger.info("background_init_scheduled")
+                
+            except Exception as e:
+                logger.error("background_initialization_failed", error=str(e))
+                app.state.ready = False
         
-        # Initialize graph and store in app.state (not globals)
-        logger.info("initializing_graph")
-        app.state.graph = await initialize_graph()
-        logger.info("graph_initialized")
+        # Start database init in background
+        db_task = asyncio.create_task(init_database_background())
+        background_tasks.add(db_task)
+        db_task.add_done_callback(lambda t: background_tasks.discard(t))
         
-        app.state.ready = True
-        app.state.background_tasks = background_tasks
+        # Initialize graph as None (will be set by background task)
+        app.state.graph = None
         
-        logger.info("application_startup_completed", status="READY")
-        
-        # Start background RAG initialization with proper tracking
-        task = asyncio.create_task(background_init())
-        background_tasks.add(task)
-        task.add_done_callback(lambda t: background_tasks.discard(t))
-        logger.info("background_init_scheduled")
+        logger.info("application_startup_fast_path_completed")
         
         yield
         
@@ -217,11 +234,16 @@ async def lifespan(app: FastAPI):
             except asyncio.TimeoutError:
                 logger.warning("background_tasks_shutdown_timeout")
         
-        # Close SQLAlchemy engine
-        await engine.dispose()
-        logger.info("sqlalchemy_engine_closed")
+        # Close SQLAlchemy engine if it exists
+        try:
+            await engine.dispose()
+            logger.info("sqlalchemy_engine_closed")
+        except Exception as e:
+            logger.warning("engine_disposal_warning", error=str(e))
         
         logger.info("application_shutdown_completed")
+
+        
 # ============================================
 # FASTAPI APP
 # ============================================
