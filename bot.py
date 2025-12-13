@@ -128,36 +128,56 @@ from llama_index.core import Settings
 from cashews import cache
 import os
 
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
 from llama_index.core import Settings
 
-# Don't initialize model at import time - make it lazy
+# ============================================
+# LLAMAINDEX CONFIGURATION - TRUE LAZY LOADING
+# ============================================
 _embed_model = None
+_embed_lock = None
 
-def get_embed_model():
-    """Lazy load embedding model"""
-    global _embed_model
-    if _embed_model is None:
-        logger.info("initializing_embedding_model")
-        _embed_model = HuggingFaceEmbedding(
-            model_name="BAAI/bge-small-en-v1.5",
-            cache_folder="./model_cache",
-            embed_batch_size=10,
-            max_length=512
+async def get_embed_model():
+    """Lazy load embedding model - truly deferred"""
+    global _embed_model, _embed_lock
+    
+    if _embed_model is not None:
+        return _embed_model
+    
+    # Initialize lock on first call
+    if _embed_lock is None:
+        _embed_lock = asyncio.Lock()
+    
+    async with _embed_lock:
+        if _embed_model is not None:
+            return _embed_model
+        
+        logger.info("loading_embedding_model")
+        
+        # Import ONLY when needed (not at module level)
+        from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+        
+        # Load in executor to not block
+        loop = asyncio.get_event_loop()
+        _embed_model = await loop.run_in_executor(
+            None,
+            lambda: HuggingFaceEmbedding(
+                model_name="BAAI/bge-small-en-v1.5",
+                cache_folder="./model_cache",
+                embed_batch_size=10,
+                max_length=512
+            )
         )
-        logger.info("embedding_model_initialized")
-    return _embed_model
+        
+        logger.info("embedding_model_loaded")
+        return _embed_model
 
-# Configure Settings to use lazy getter
+# Settings WITHOUT embed_model
 Settings.llm = None 
 Settings.chunk_size = 512
 Settings.chunk_overlap = 50
 
-
-# Set other settings
-Settings.llm = None 
-Settings.chunk_size = 512
-Settings.chunk_overlap = 50
+# Remove duplicate settings (you have them twice in your code)
 
 
 # ============================================
@@ -697,7 +717,7 @@ async def initialize_rag(
     """
     
     Settings.embed_model = get_embed_model()
-    
+
     if not business_id:
         raise ValueError("business_id is required")
     

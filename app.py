@@ -214,6 +214,14 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+
+@app.get("/ping")
+@app.head("/ping")  # Support HEAD requests from health checkers
+async def ping():
+    """Instant response - no dependencies"""
+    return {"status": "ok"}
+
+    
 # CORS middleware
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*")
 if allowed_origins == "*":
