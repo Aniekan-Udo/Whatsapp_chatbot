@@ -56,11 +56,11 @@ from llama_index.core import (
 
 import os
 from cashews import cache
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
-from llama_index.vector_stores.postgres import PGVectorStore
-from llama_index.core import SimpleDirectoryReader, StorageContext
-from llama_index.core import VectorStoreIndex
-from llama_index.vector_stores.postgres import PGVectorStore
+# from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
+# from llama_index.vector_stores.postgres import PGVectorStore
+# from llama_index.core import SimpleDirectoryReader, StorageContext
+# from llama_index.core import VectorStoreIndex
+# from llama_index.vector_stores.postgres import PGVectorStore
 #from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 # Caching
@@ -101,23 +101,7 @@ if not POSTGRES_URI or not POSTGRES_URI_POOLER:
 print(f"POSTGRES_URI: {POSTGRES_URI.split('@')[0]}@...")
 print(f"POSTGRES_URI_POOLER: {POSTGRES_URI_POOLER.split('@')[0]}@...")
 
-# ============================================
-# STRUCTURED LOGGING SETUP
-# ============================================
 
-# structlog.configure(
-#     processors=[
-#         structlog.contextvars.merge_contextvars,
-#         structlog.processors.add_log_level,
-#         structlog.processors.TimeStamper(fmt="iso"),
-#         JSONRenderer()
-#     ],
-#     wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO level
-#     context_class=dict,
-#     logger_factory=structlog.PrintLoggerFactory(),
-# )
-
-# logger = structlog.get_logger()
 from monitoring import logger
 # ============================================
 # LLAMAINDEX CONFIGURATION
@@ -128,56 +112,17 @@ from llama_index.core import Settings
 from cashews import cache
 import os
 
+# from llama_index.embeddings.cohere import CohereEmbedding
 
-from llama_index.core import Settings
+# # Simple embedding - no downloads, instant startup
+# Settings.embed_model = CohereEmbedding(
+#     api_key=os.getenv("COHERE_API_KEY"),
+#     model_name="embed-english-light-v3.0"
+# )
 
-# ============================================
-# LLAMAINDEX CONFIGURATION - TRUE LAZY LOADING
-# ============================================
-_embed_model = None
-_embed_lock = None
-
-async def get_embed_model():
-    """Lazy load embedding model - truly deferred"""
-    global _embed_model, _embed_lock
-    
-    if _embed_model is not None:
-        return _embed_model
-    
-    # Initialize lock on first call
-    if _embed_lock is None:
-        _embed_lock = asyncio.Lock()
-    
-    async with _embed_lock:
-        if _embed_model is not None:
-            return _embed_model
-        
-        logger.info("loading_embedding_model")
-        
-        # Import ONLY when needed (not at module level)
-        from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-        
-        # Load in executor to not block
-        loop = asyncio.get_event_loop()
-        _embed_model = await loop.run_in_executor(
-            None,
-            lambda: HuggingFaceEmbedding(
-                model_name="BAAI/bge-small-en-v1.5",
-                cache_folder="./model_cache",
-                embed_batch_size=10,
-                max_length=512
-            )
-        )
-        
-        logger.info("embedding_model_loaded")
-        return _embed_model
-
-# Settings WITHOUT embed_model
-Settings.llm = None 
-Settings.chunk_size = 512
-Settings.chunk_overlap = 50
-
-# Remove duplicate settings (you have them twice in your code)
+# Settings.llm = None 
+# Settings.chunk_size = 512
+# Settings.chunk_overlap = 50
 
 
 # ============================================
@@ -340,11 +285,58 @@ Based on the chat history below, please update the user information:"""
 # PROFILE EXTRACTOR
 # ============================================
 
-profile_extractor = create_extractor(
-    model,
-    tools=[Profile],
-    tool_choice="Profile",
-)
+# profile_extractor = create_extractor(
+#     model,
+#     tools=[Profile],
+#     tool_choice="Profile",
+# )
+
+# ============================================
+# LAZY LOADED COMPONENTS (ADD THIS SECTION)
+# ============================================
+
+_profile_extractor = None
+_llama_index_setup = False
+
+def get_profile_extractor():
+    """Lazy load TrustCall extractor (10s import time)"""
+    global _profile_extractor
+    
+    if _profile_extractor is None:
+        logger.info("loading_trustcall_extractor")
+        from trustcall import create_extractor
+        
+        _profile_extractor = create_extractor(
+            model,
+            tools=[Profile],
+            tool_choice="Profile",
+        )
+        logger.info("trustcall_extractor_loaded")
+    
+    return _profile_extractor
+
+def setup_llama_index():
+    """Lazy setup LlamaIndex (6s import time)"""
+    global _llama_index_setup
+    
+    if _llama_index_setup:
+        return
+    
+    logger.info("setting_up_llama_index")
+    
+    from llama_index.core import Settings
+    from llama_index.embeddings.cohere import CohereEmbedding
+    
+    Settings.embed_model = CohereEmbedding(
+        api_key=os.getenv("COHERE_API_KEY"),
+        model_name="embed-english-light-v3.0"
+    )
+    Settings.llm = None
+    Settings.chunk_size = 512
+    Settings.chunk_overlap = 50
+    
+    _llama_index_setup = True
+    logger.info("llama_index_ready")
 
 # ============================================
 # EXCEPTION HANDLING
@@ -698,26 +690,15 @@ async def initialize_rag(
     doc_paths: List[str] = None,
     force_reinit: bool = False
 ) -> Dict[str, Any]:
-    """
-    Initialize RAG for a business and return config.
+    """Initialize RAG for a business and return config."""
     
-    This function:
-    1. Checks if RAG is already initialized (table exists)
-    2. If not, loads documents and creates vector embeddings
-    3. Returns a config dict that can be cached
+    # Setup LlamaIndex on first use
+    setup_llama_index()
     
-    Args:
-        business_id: The business ID to initialize RAG for
-        doc_path: Single document path (optional)
-        doc_paths: List of document paths (optional)
-        force_reinit: Force reinitialization even if table exists
+    # Import here, not at module level
+    from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
+    from llama_index.vector_stores.postgres import PGVectorStore
     
-    Returns:
-        Dict with collection_name and status
-    """
-    
-    Settings.embed_model = get_embed_model()
-
     if not business_id:
         raise ValueError("business_id is required")
     
@@ -969,9 +950,10 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
     
     try:
         # API call with built-in retry
-        result = await profile_extractor.ainvoke({
-            "messages": updated_messages,
-            "existing": existing_memories
+        extractor = get_profile_extractor()  # Lazy load on first use
+        result = await extractor.ainvoke({
+        "messages": updated_messages,
+        "existing": existing_memories
         })
         
     except Exception as e:
@@ -1326,15 +1308,15 @@ async def remove_cart_item(state: MessagesState, config: RunnableConfig):
 
 @monitor(operation="rag_search")
 async def rag_search(state: MessagesState, config: RunnableConfig):
-    """
-    Perform RAG search with timeout protection and graceful error handling.
+    """Perform RAG search with timeout protection and graceful error handling."""
     
-    This function:
-    1. Initializes RAG if needed (with timeout)
-    2. Creates a retriever from cached config
-    3. Performs semantic search
-    4. Returns formatted results to the agent
-    """
+    # Setup LlamaIndex if not already
+    setup_llama_index()
+    
+    # Import here
+    from llama_index.core import VectorStoreIndex
+    from llama_index.vector_stores.postgres import PGVectorStore
+    
     business_id = config["configurable"].get("business_id")
     
     if not business_id:
@@ -1370,7 +1352,7 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
         try:
             rag_config = await asyncio.wait_for(
                 initialize_rag(business_id=business_id),
-                timeout=45.0  # 45 second timeout for initialization
+                timeout=60.0  # 60 second timeout for initialization
             )
         except asyncio.TimeoutError:
             logger.error("rag_init_timeout", business_id=business_id)
