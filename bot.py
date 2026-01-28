@@ -139,7 +139,7 @@ except Exception as e:
 # ============================================
 
 # Use psycopg
-async_uri = POSTGRES_URI.replace('postgresql://', 'postgresql+psycopg://')
+async_uri = POSTGRES_URI.replace('postgresql://', 'postgresql+asyncpg://')
 
 if 'sslmode' not in async_uri:
     separator = '&' if '?' in async_uri else '?'
