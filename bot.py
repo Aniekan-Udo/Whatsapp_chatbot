@@ -4,19 +4,22 @@ import os
 if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from monitoring import setup_monitoring, monitor
 
+
+# OPIK IMPORTS
+from opik.integrations.langchain import OpikTracer
+from opik import track
+from opik import opik_context
 
 import psycopg.errors as psycopg_errors
 import uuid
 from typing import List, Optional, Dict, Any
 import pandas as pd
-import os
 import json
 import time
 from datetime import datetime
+from datetime import timedelta
 
-# LangChain & LangGraph
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, merge_message_runs
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import MessagesState
@@ -24,28 +27,21 @@ from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.base import BaseStore
 
-# Document loaders
 from langchain_community.document_loaders import CSVLoader, WebBaseLoader, TextLoader
 
-# Pydantic
 from pydantic import BaseModel, Field
 from pydantic import field_validator
 
-# TrustCall
 from trustcall import create_extractor
 from langchain_groq import ChatGroq
-
-# PostgreSQL
 
 from psycopg_pool import AsyncConnectionPool
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
-# SQLAlchemy
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import Column, String, JSON, DateTime, Boolean, func, select
-
 
 from llama_index.core import (
     VectorStoreIndex,
@@ -54,25 +50,10 @@ from llama_index.core import (
     Settings
 )
 
-import os
 from cashews import cache
-# from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
-# from llama_index.vector_stores.postgres import PGVectorStore
-# from llama_index.core import SimpleDirectoryReader, StorageContext
-# from llama_index.core import VectorStoreIndex
-# from llama_index.vector_stores.postgres import PGVectorStore
-#from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-# Caching
-from aiocache import Cache
-from aiocache.serializers import PickleSerializer
-
-# Structured Logging
-import structlog
-from structlog.processors import JSONRenderer
 from sqlalchemy import text
 
-# Retry logic
 from tenacity import (
     retry, retry_if_exception_type, 
     stop_after_delay, stop_after_attempt,
@@ -83,63 +64,34 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ============================================
-# CONFIGURATION
-# ============================================
-
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
     raise ValueError("API_KEY not found in environment variables")
+
+import opik
+
+opik.configure(
+    api_key=os.getenv("OPIK_API_KEY")
+)
 
 POSTGRES_URI = os.getenv("POSTGRES_URI")
 POSTGRES_URI_POOLER = os.getenv("POSTGRES_URI_POOLER")
 if not POSTGRES_URI or not POSTGRES_URI_POOLER:
     raise ValueError("POSTGRES_URI and POSTGRES_URI_POOLER must be set")
 
-# Don't add prepare_threshold to URI - it's not supported by psycopg_pool
-# We'll pass it via kwargs instead
 print(f"POSTGRES_URI: {POSTGRES_URI.split('@')[0]}@...")
 print(f"POSTGRES_URI_POOLER: {POSTGRES_URI_POOLER.split('@')[0]}@...")
 
-
 from monitoring import logger
-# ============================================
-# LLAMAINDEX CONFIGURATION
-# ============================================
 
-#from llama_index.embeddings import HuggingFaceEmbeddings
-from llama_index.core import Settings
-from cashews import cache
-import os
-
-# from llama_index.embeddings.cohere import CohereEmbedding
-
-# # Simple embedding - no downloads, instant startup
-# Settings.embed_model = CohereEmbedding(
-#     api_key=os.getenv("COHERE_API_KEY"),
-#     model_name="embed-english-light-v3.0"
-# )
-
-# Settings.llm = None 
-# Settings.chunk_size = 512
-# Settings.chunk_overlap = 50
-
-
-# ============================================
-# GROQ MODEL
-# ============================================
+logger.info("opik_configured", workspace=os.getenv("OPIK_WORKSPACE", "default"))
 
 try:
-    model = ChatGroq(model="llama-3.3-70b-versatile", api_key=API_KEY)
+    model = ChatGroq(model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"), api_key=API_KEY)
 except Exception as e:
     raise ValueError(f"Failed to initialize ChatGroq model: {e}")
 
-# ============================================
-# COMPLETE SQLAlchemy Setup - Replace in bot.py
-# ============================================
-
-# Use psycopg
-async_uri = POSTGRES_URI.replace('postgresql://', 'postgresql+psycopg://')
+async_uri = POSTGRES_URI.replace('postgresql://', 'postgresql+asyncpg://')
 
 if 'sslmode' not in async_uri:
     separator = '&' if '?' in async_uri else '?'
@@ -153,12 +105,11 @@ engine = create_async_engine(
     max_overflow=10,
     echo=False,
     connect_args={
-        "prepare_threshold": 0,  
-        "autocommit": True,      
+        "prepare_threshold": 0,
+        "autocommit": True,
     }
 )
 
-#Session factory for database operations
 async_session_factory = async_sessionmaker(
     engine,
     class_=AsyncSession,
@@ -167,10 +118,8 @@ async_session_factory = async_sessionmaker(
 
 print(f"✅ SQLAlchemy engine created with prepare_threshold=0")
 
-# ============================================
-# DATABASE MODELS
-# ============================================
 Base = declarative_base()
+
 class UserProfile(Base):
     __tablename__ = 'user_profiles'
     
@@ -196,12 +145,7 @@ class BusinessDocument(Base):
     uploaded_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
-# ============================================
-# PYDANTIC MODELS
-# ============================================
-
 class Profile(BaseModel):
-    """User profile information for personalizing customer service."""
     name: Optional[str] = Field(default=None, description="Customer's name")
     location: Optional[str] = Field(default=None, description="Customer's location")
     address: Optional[str] = Field(default=None, description="Customer's delivery address")
@@ -209,12 +153,10 @@ class Profile(BaseModel):
     human_active: Optional[bool] = Field(default=None, description="Human agent active")
 
 class CartItem(BaseModel):
-    """Cart item with quantity support"""
     item: str = Field(description="Name of the product/item")
     quantity: int = Field(default=1, ge=1, le=99, description="Quantity (1-99)")
 
 class CustomerAction(BaseModel):
-    """Handle customer requests with multiple actions."""
     update_profile: bool = Field(default=False, description="Save profile info")
     search_menu: bool = Field(default=False, description="Search menu items")
     search_query: Optional[str] = Field(default=None, description="Search query")
@@ -225,7 +167,6 @@ class CustomerAction(BaseModel):
     view_cart: bool = Field(default=False, description="View cart")
     ready_to_order: bool = Field(default=False, description="Ready to order")
     ready_to_pay: bool = Field(default=False, description="Ready to pay")
-
 
     @field_validator('search_query')
     @classmethod
@@ -240,10 +181,6 @@ class CustomerAction(BaseModel):
         if v and len(v) > 50:
             raise ValueError("Too many items in single request (max 50)")
         return v
-
-# ============================================
-# PROMPTS
-# ============================================
 
 MSG_PROMPT = """
 You are a whatsapp assistant, your duty is to assist business owners attend to customers.
@@ -281,25 +218,10 @@ CRITICAL:
 
 Based on the chat history below, please update the user information:"""
 
-# ============================================
-# PROFILE EXTRACTOR
-# ============================================
-
-# profile_extractor = create_extractor(
-#     model,
-#     tools=[Profile],
-#     tool_choice="Profile",
-# )
-
-# ============================================
-# LAZY LOADED COMPONENTS (ADD THIS SECTION)
-# ============================================
-
 _profile_extractor = None
 _llama_index_setup = False
 
 def get_profile_extractor():
-    """Lazy load TrustCall extractor (10s import time)"""
     global _profile_extractor
     
     if _profile_extractor is None:
@@ -315,36 +237,44 @@ def get_profile_extractor():
     
     return _profile_extractor
 
+
+import threading
+
+_llama_index_setup = False
+_setup_lock = threading.Lock()
+
 def setup_llama_index():
-    """Lazy setup LlamaIndex (6s import time)"""
     global _llama_index_setup
     
+    # Fast path: already initialized (no lock needed)
     if _llama_index_setup:
         return
     
-    logger.info("setting_up_llama_index")
-    
-    from llama_index.core import Settings
-    from llama_index.embeddings.cohere import CohereEmbedding
-    
-    Settings.embed_model = CohereEmbedding(
-        api_key=os.getenv("COHERE_API_KEY"),
-        model_name="embed-english-light-v3.0"
-    )
-    Settings.llm = None
-    Settings.chunk_size = 512
-    Settings.chunk_overlap = 50
-    
-    _llama_index_setup = True
-    logger.info("llama_index_ready")
-
-# ============================================
-# EXCEPTION HANDLING
-# ============================================
+    # Slow path: might need initialization
+    with _setup_lock:
+        # Double-check inside lock (another thread might have initialized)
+        if _llama_index_setup:
+            return
+        
+        logger.info("setting_up_llama_index")
+        
+        from llama_index.core import Settings
+        from llama_index.embeddings.cohere import CohereEmbedding
+        
+        Settings.embed_model = CohereEmbedding(
+            api_key=os.getenv("COHERE_API_KEY"),
+            model_name=os.getenv("COHERE_EMBED_MODEL", "embed-english-light-v3.0")
+        )
+        Settings.llm = None
+        Settings.chunk_size = 512
+        Settings.chunk_overlap = 50
+        
+        _llama_index_setup = True
+        logger.info("llama_index_ready")
 
 WHATSAPP_CHATBOT_EXCEPTIONS = (
     ConnectionError,
-    psycopg_errors.Error,       
+    psycopg_errors.Error,
     TimeoutError,
     ValueError,
     IndexError,
@@ -353,20 +283,14 @@ WHATSAPP_CHATBOT_EXCEPTIONS = (
     FileNotFoundError,
 )
 
-# ============================================
-# LOCK MANAGEMENT
-# ============================================
-
 _init_locks: Dict[str, asyncio.Lock] = {}
 _locks_lock = asyncio.Lock()
 
 async def get_init_lock(business_id):
-    """Get or create a lock for a business ID."""
     async with _locks_lock:
         if business_id not in _init_locks:
             _init_locks[business_id] = asyncio.Lock()
             
-            # Cleanup old locks
             if len(_init_locks) > 1000:
                 to_remove = list(_init_locks.keys())[:100]
                 for key in to_remove:
@@ -374,36 +298,23 @@ async def get_init_lock(business_id):
         
         return _init_locks[business_id]
 
-# ============================================
-# DATABASE SETUP
-# ============================================
-
 store = None
 saver = None
 _pool: AsyncConnectionPool = None
 
 
-
-# ============================================
-# GET_POOL FUNCTION
-# ============================================
-
-@monitor(operation="get_pool")
 async def get_pool() -> AsyncConnectionPool:
-    """Get or create database connection pool."""
     global _pool
     
     if _pool is None or _pool.closed:
         logger.info("pool_creation_started")
         
-        # ✅ Remove prepare_threshold from URI if present
         clean_uri = POSTGRES_URI
         if 'prepare_threshold' in clean_uri:
             clean_uri = clean_uri.replace('&prepare_threshold=0', '').replace('?prepare_threshold=0', '')
         
         logger.info("creating_pool", uri_preview=clean_uri.split('@')[0])
         
-        # ✅ Pass prepare_threshold via kwargs parameter
         _pool = AsyncConnectionPool(
             conninfo=clean_uri,
             min_size=2,
@@ -415,13 +326,12 @@ async def get_pool() -> AsyncConnectionPool:
             reconnect_timeout=5.0,
             num_workers=2,
             kwargs={
-                "prepare_threshold": 0  # ✅ Disable prepared statements here
+                "prepare_threshold": 0
             }
         )
         
         await asyncio.wait_for(_pool.open(wait=True), timeout=20.0)
         
-        # Test pool with cursor (not fetchval)
         async with _pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT 1")
@@ -432,48 +342,37 @@ async def get_pool() -> AsyncConnectionPool:
     
     return _pool
 
-
-
 import signal
-@monitor(operation="shutdown")
+
+
 async def shutdown(signal_received):
-    """Cleanup on shutdown."""
     logger.info("shutdown_initiated", signal=signal_received)
     
-    # Close connection pools
     global _pool
     if _pool:
         await _pool.close()
     
-    # Close SQLAlchemy engine
     await engine.dispose()
     
     logger.info("shutdown_complete")
 
-# Register signal handlers
 for sig in (signal.SIGTERM, signal.SIGINT):
     signal.signal(sig, lambda s, f: asyncio.create_task(shutdown(s)))
 
-@monitor(operation="setup_database")
 async def setup_database():
-    """Setup database tables and return store and saver instances."""
     global store, saver
     
     logger.info("database_setup_started")
     
     try:
-        # Create SQLAlchemy tables
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         
         logger.info("sqlalchemy_tables_created")
         
-        # Get connection pool for LangGraph
         pool = await get_pool()
         
-        # Create LangGraph tables
         async with pool.connection() as conn:
-            # Store table
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS store (
                     prefix TEXT NOT NULL,
@@ -487,7 +386,6 @@ async def setup_database():
             
             await conn.execute("CREATE INDEX IF NOT EXISTS store_prefix_idx ON store(prefix);")
             
-            # Checkpoints table
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS checkpoints (
                     thread_id TEXT NOT NULL,
@@ -501,7 +399,6 @@ async def setup_database():
                 );
             """)
             
-            # Writes table
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS writes (
                     thread_id TEXT NOT NULL,
@@ -518,7 +415,6 @@ async def setup_database():
         
         logger.info("langgraph_tables_created")
         
-        # Initialize store and saver
         store = AsyncPostgresStore(pool)
         saver = AsyncPostgresSaver(pool)
         
@@ -532,20 +428,14 @@ async def setup_database():
         logger.error("database_setup_failed", error=str(e))
         raise
 
-# ============================================
-# BUSINESS DOCUMENT MANAGEMENT
-# ============================================
 
-
-@monitor(operation="register_document")
 async def register_business_document(
-    business_id: str, 
-    document_path: str, 
-    document_name: str = None, 
-    document_type: str = None, 
+    business_id: str,
+    document_path: str,
+    document_name: str = None,
+    document_type: str = None,
     metadata: dict = None
 ):
-    """Register a document for a business."""
     if not document_path.startswith('s3://') and not os.path.exists(document_path):
         raise FileNotFoundError(f"Document not found: {document_path}")
     
@@ -569,7 +459,7 @@ async def register_business_document(
     
     logger.info("document_registered", business_id=business_id, document_name=document_name)
 
-@monitor(operation="get_document")
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=5),
@@ -580,7 +470,6 @@ async def register_business_document(
     reraise=True
 )
 async def get_business_document(business_id: str) -> Optional[str]:
-    """Get the document path for a business."""
     async with async_session_factory() as session:
         result = await session.execute(
             select(BusinessDocument).where(
@@ -600,21 +489,12 @@ async def get_business_document(business_id: str) -> Optional[str]:
         
         return None
 
-# ============================================
-# RAG WITH LLAMAINDEX
-# ============================================
-@monitor(operation="create_metadata_indexes")
+
 async def create_metadata_indexes(business_id: str):
-    """
-    Create metadata indexes for efficient filtering.
-    LlamaIndex handles vector indexes automatically.
-    """
-    # ✅ FIX: LlamaIndex prefixes with "data_" - match exactly
     table_name = f"data_business_{business_id}_menu"
     
     try:
         async with engine.begin() as conn:
-            # Check if table exists first
             table_exists = await conn.execute(text(f"""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables 
@@ -624,12 +504,11 @@ async def create_metadata_indexes(business_id: str):
             exists = (await table_exists.fetchone())[0]
             
             if not exists:
-                logger.warning("table_not_found", 
+                logger.warning("table_not_found",
                              business_id=business_id,
                              table_name=table_name)
                 return
             
-            # Create indexes WITHOUT CONCURRENTLY (causes issues in transactions)
             await conn.execute(text(f"""
                 CREATE INDEX IF NOT EXISTS idx_{table_name}_category 
                 ON {table_name} 
@@ -648,7 +527,7 @@ async def create_metadata_indexes(business_id: str):
                 USING btree (((metadata_->>'price')::numeric))
             """))
         
-        logger.info("metadata_indexes_created", 
+        logger.info("metadata_indexes_created",
                     business_id=business_id,
                     table_name=table_name)
                     
@@ -656,22 +535,11 @@ async def create_metadata_indexes(business_id: str):
         logger.error("metadata_index_creation_failed",
                     business_id=business_id,
                     error=str(e))
-        
 
-# ============================================
-# SETUP (1 LINE)
-# ============================================
-cache.setup("mem://")  # Use in-memory cache
+cache.setup("mem://")
 logger.info("cache_initialized", backend="memory")
 
-# ============================================
-# YOUR FUNCTION (JUST BUSINESS LOGIC)
-# ============================================
-@cache(
-    ttl="30m",
-    key="rag:{business_id}",
-    lock=True
-)
+@cache(ttl=timedelta(minutes=30), key="business_id:{business_id}")
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -683,19 +551,13 @@ logger.info("cache_initialized", backend="memory")
     )),
     reraise=True
 )
-@monitor(operation="rag_init")
 async def initialize_rag(
-    business_id: str = None, 
-    doc_path: str = None, 
-    doc_paths: List[str] = None,
-    force_reinit: bool = False
+    business_id: str = None,
+    doc_path: str = None,
+    doc_paths: List[str] = None
 ) -> Dict[str, Any]:
-    """Initialize RAG for a business and return config."""
-    
-    # Setup LlamaIndex on first use
     setup_llama_index()
     
-    # Import here, not at module level
     from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
     from llama_index.vector_stores.postgres import PGVectorStore
     
@@ -704,36 +566,7 @@ async def initialize_rag(
     
     collection_name = f"business_{business_id}_menu"
     
-    # Check if already initialized (table exists with data) unless force_reinit
-    if not force_reinit:
-        try:
-            vector_store = PGVectorStore.from_params(
-                connection_string=POSTGRES_URI_POOLER,
-                table_name=collection_name,
-                embed_dim=384,
-                hybrid_search=False,
-                perform_setup=False,  # Don't create table, just check
-            )
-            
-            # Quick check if table has data
-            index = VectorStoreIndex.from_vector_store(vector_store)
-            
-            logger.info("rag_already_initialized", business_id=business_id)
-            return {
-                "collection_name": collection_name,
-                "status": "existing",
-                "business_id": business_id
-            }
-            
-        except Exception as e:
-            # Table doesn't exist or is inaccessible, proceed with initialization
-            logger.info("rag_initialization_needed", 
-                       business_id=business_id,
-                       reason=str(e))
     
-    logger.info("rag_initialization_started", business_id=business_id)
-    
-    # Get document paths
     if doc_path and not doc_paths:
         doc_paths = [doc_path]
     
@@ -742,11 +575,9 @@ async def initialize_rag(
         if not doc_paths:
             raise ValueError(f"No documents found for business '{business_id}'")
     
-    # Ensure doc_paths is a list
     if isinstance(doc_paths, str):
         doc_paths = [doc_paths]
     
-    # Validate files exist
     missing_files = []
     for path in doc_paths:
         if not os.path.exists(path):
@@ -757,9 +588,8 @@ async def initialize_rag(
             f"Documents not found: {', '.join(missing_files)}"
         )
     
-    # Load documents
-    logger.info("loading_documents", 
-               business_id=business_id, 
+    logger.info("loading_documents",
+               business_id=business_id,
                file_count=len(doc_paths))
     
     documents = SimpleDirectoryReader(input_files=doc_paths).load_data()
@@ -767,19 +597,18 @@ async def initialize_rag(
     if not documents:
         raise ValueError(f"No documents could be loaded from {doc_paths}")
     
-    logger.info("documents_loaded", 
-               business_id=business_id, 
+    logger.info("documents_loaded",
+               business_id=business_id,
                document_count=len(documents),
                total_chars=sum(len(doc.text) for doc in documents))
     
-    # Create vector store with DIRECT connection (not pooler for long operations)
     try:
         vector_store = PGVectorStore.from_params(
-            connection_string=POSTGRES_URI,  # Use direct for indexing
+            connection_string=POSTGRES_URI,
             table_name=collection_name,
             embed_dim=384,
-            hybrid_search=False, 
-            perform_setup=True,  
+            hybrid_search=True,
+            perform_setup=True,
             hnsw_kwargs={
                 "hnsw_m": 16,
                 "hnsw_ef_construction": 64,
@@ -788,13 +617,12 @@ async def initialize_rag(
             },
         )
         
-        logger.info("vector_store_created", 
+        logger.info("vector_store_created",
                    business_id=business_id,
                    table_name=collection_name)
         
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
         
-        # Create index (this ingests and embeds documents - takes time)
         logger.info("creating_embeddings", business_id=business_id)
         
         VectorStoreIndex.from_documents(
@@ -806,22 +634,20 @@ async def initialize_rag(
         logger.info("embeddings_created", business_id=business_id)
         
     except Exception as e:
-        logger.error("vector_store_creation_failed", 
+        logger.error("vector_store_creation_failed",
                     business_id=business_id,
                     error=str(e),
                     error_type=type(e).__name__)
         raise
     
-    # Create metadata indexes for better query performance
     try:
         await create_metadata_indexes(business_id)
     except Exception as idx_error:
-        # Don't fail if index creation fails
-        logger.warning("metadata_index_creation_skipped", 
-                     business_id=business_id, 
+        logger.warning("metadata_index_creation_skipped",
+                     business_id=business_id,
                      error=str(idx_error))
     
-    logger.info("rag_initialized_successfully", 
+    logger.info("rag_initialized_successfully",
                business_id=business_id,
                collection_name=collection_name)
     
@@ -831,14 +657,7 @@ async def initialize_rag(
         "business_id": business_id,
         "document_count": len(documents)
     }
-            
-# ============================================
-# LANGGRAPH NODES
-# ============================================
 
-# ============================================
-# SIMPLIFIED GROQ API CALL
-# ============================================
 
 @retry(
     stop=stop_after_attempt(3),
@@ -851,37 +670,46 @@ async def initialize_rag(
     reraise=True
 )
 @cache(ttl="2m")
-@monitor(model="llama-3.3-70b", track_tokens=True)
-async def call_groq_api(messages: list, tools: list = None):
-    """
-    Call Groq API with retry and caching.
-    
-    Retry strategy:
-    - 3 attempts with exponential backoff
-    - Only retry transient network errors
-    - Cache successful responses for 2 minutes
-    """
+
+async def call_groq_api(
+    messages: list,
+    tools: list = None,
+    business_id: str = None,
+    user_id: str = None
+):
     try:
         logger.info("groq_api_call_started")
         
+        opik_config = {}
+        if business_id or user_id:
+            tracer = OpikTracer(
+                tags=["production", "groq"] +
+                     ([f"business:{business_id}"] if business_id else []),
+                metadata={
+                    "business_id": business_id,
+                    "user_id": user_id,
+                    "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                    "has_tools": tools is not None
+                }
+            )
+            opik_config = {"callbacks": [tracer]}
+        
         if tools:
-            response = await model.bind_tools(tools).ainvoke(messages)
+            response = await model.bind_tools(tools).ainvoke(messages, config=opik_config)
         else:
-            response = await model.ainvoke(messages)
+            response = await model.ainvoke(messages, config=opik_config)
         
         logger.info("groq_api_call_success")
         return response
         
     except Exception as e:
-        logger.error("groq_api_call_failed", 
-                    error=str(e), 
+        logger.error("groq_api_call_failed",
+                    error=str(e),
                     error_type=type(e).__name__)
         raise
 
 
-@monitor(operation="chatbot")
 async def chatbot(state: MessagesState, config: RunnableConfig):
-    """Main chatbot logic with graceful error handling."""
     global store
     
     user_id = config["configurable"]["user_id"]
@@ -901,17 +729,17 @@ async def chatbot(state: MessagesState, config: RunnableConfig):
     try:
         response = await call_groq_api(
             [SystemMessage(content=system_msg)] + state["messages"],
-            tools=[CustomerAction]
+            tools=[CustomerAction],
+            business_id=business_id,
+            user_id=user_id
         )
         return {"messages": [response]}
         
     except Exception as e:
-        # After all retries failed
-        logger.error("chatbot_api_failure", 
+        logger.error("chatbot_api_failure",
                     business_id=business_id,
                     error=str(e))
         
-        # Return graceful fallback
         return {
             "messages": [AIMessage(
                 content="I'm having trouble connecting right now. Please try again in a moment or contact support if this continues."
@@ -919,9 +747,7 @@ async def chatbot(state: MessagesState, config: RunnableConfig):
         }
 
 
-@monitor(operation="write_memory")
 async def write_memory(state: MessagesState, config: RunnableConfig):
-    """Update user profile with graceful error handling."""
     global store
     
     user_id = config["configurable"]["user_id"]
@@ -949,15 +775,27 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
     ))
     
     try:
-        # API call with built-in retry
-        extractor = get_profile_extractor()  # Lazy load on first use
-        result = await extractor.ainvoke({
-        "messages": updated_messages,
-        "existing": existing_memories
-        })
+        extractor = get_profile_extractor()
+        
+        tracer = OpikTracer(
+            tags=["profile_extraction", f"business:{business_id}"],
+            metadata={"business_id": business_id, "user_id": user_id}
+        )
+        
+        result = await extractor.ainvoke(
+            {"messages": updated_messages, "existing": existing_memories},
+            config={"callbacks": [tracer]}
+        )
+        
+        profile_data: Profile = result['responses'][0]
+        
+        logger.info("profile_extracted",
+                   business_id=business_id,
+                   user_id=user_id,
+                   has_name=profile_data.name is not None)
         
     except Exception as e:
-        logger.error("profile_extraction_failed", 
+        logger.error("profile_extraction_failed",
                     business_id=business_id,
                     error=str(e))
         
@@ -965,23 +803,14 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
         return {
             "messages": [{
                 "role": "tool",
-                "content": "Profile update temporarily unavailable. Your information will be saved on your next interaction.",
+                "content": "Profile update temporarily unavailable.",
                 "tool_call_id": tool_calls[0]['id']
             }]
         }
     
-    profile_data: Profile = result['responses'][0]
-    
-    logger.info("profile_extracted", 
-               business_id=business_id, 
-               user_id=user_id, 
-               has_name=profile_data.name is not None)
-    
-    # Save to LangGraph store
-    for r, rmeta in zip(result["responses"], result["response_metadata"]):
+    for r in result["responses"]:
         await store.aput(namespace, "user_memory", r.model_dump(mode="json"))
     
-    # Database save with dedicated retry
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=5),
@@ -992,7 +821,6 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
         reraise=True
     )
     async def save_profile_to_db():
-        """Database save with retry for transient failures."""
         async with async_session_factory() as session:
             profile = await session.get(UserProfile, (business_id, user_id))
             
@@ -1000,7 +828,6 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
                 profile = UserProfile(business_id=business_id, user_id=user_id)
                 session.add(profile)
             
-            # Update fields only if provided
             if profile_data.name is not None:
                 profile.name = profile_data.name
             if profile_data.location is not None:
@@ -1023,7 +850,6 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
         logger.error("profile_db_save_failed",
                     business_id=business_id,
                     error=str(db_error))
-        # Continue anyway - profile was saved to store
     
     tool_calls = state['messages'][-1].tool_calls
     return {
@@ -1034,9 +860,8 @@ async def write_memory(state: MessagesState, config: RunnableConfig):
         }]
     }
 
-@monitor(operation="check_address")
+
 async def check_address_and_finalize(state: MessagesState, config: RunnableConfig):
-    """Check if user has address before finalizing order."""
     global store
     
     user_id = config["configurable"]["user_id"]
@@ -1071,9 +896,8 @@ async def check_address_and_finalize(state: MessagesState, config: RunnableConfi
             }]
         }
 
-@monitor(operation="add_to_cart")
+
 async def add_to_cart(state: MessagesState, config: RunnableConfig):
-    """Add items to cart using SQLAlchemy."""
     user_id = config["configurable"]["user_id"]
     business_id = config["configurable"]["business_id"]
     
@@ -1105,7 +929,6 @@ async def add_to_cart(state: MessagesState, config: RunnableConfig):
             
             current_cart = profile.cart or {}
             
-            # Convert old list format to dict
             if isinstance(current_cart, list):
                 current_cart = {item: 1 for item in current_cart}
             
@@ -1155,7 +978,6 @@ async def add_to_cart(state: MessagesState, config: RunnableConfig):
             
             logger.info("cart_updated", business_id=business_id, user_id=user_id, total_items=total_items)
         
-        # Format success message
         message_parts = []
         if added_items:
             message_parts.append(f"Added: {', '.join(added_items)}")
@@ -1186,9 +1008,8 @@ async def add_to_cart(state: MessagesState, config: RunnableConfig):
             }]
         }
 
-@monitor(operation="remove_from_cart")
+
 async def remove_cart_item(state: MessagesState, config: RunnableConfig):
-    """Remove items from cart using SQLAlchemy."""
     user_id = config["configurable"]["user_id"]
     business_id = config["configurable"]["business_id"]
     
@@ -1269,7 +1090,6 @@ async def remove_cart_item(state: MessagesState, config: RunnableConfig):
             
             logger.info("cart_items_removed", business_id=business_id, user_id=user_id, removed=len(removed_items))
         
-        # Build success message
         parts = []
         if removed_items:
             parts.append(f"Removed completely: {', '.join(removed_items)}")
@@ -1306,14 +1126,25 @@ async def remove_cart_item(state: MessagesState, config: RunnableConfig):
             }]
         }
 
-@monitor(operation="rag_search")
-async def rag_search(state: MessagesState, config: RunnableConfig):
-    """Perform RAG search with timeout protection and graceful error handling."""
+
+async def vector_store_exists(collection_name: str) -> bool:
+    """Check if vector store table exists in PostgreSQL"""
+    try:
+        import asyncpg
+        conn = await asyncpg.connect(POSTGRES_URI)
+        result = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
+            collection_name
+        )
+        await conn.close()
+        return result
+    except Exception:
+        return False
     
-    # Setup LlamaIndex if not already
+    
+async def rag_search(state: MessagesState, config: RunnableConfig):
     setup_llama_index()
     
-    # Import here
     from llama_index.core import VectorStoreIndex
     from llama_index.vector_stores.postgres import PGVectorStore
     
@@ -1328,7 +1159,8 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
                 "tool_call_id": state["messages"][-1].tool_calls[0]['id']
             }]
         }
-    
+    get_init_lock(business_id)
+
     last_message = state["messages"][-1]
     tool_call = last_message.tool_calls[0]
     args = tool_call.get('args', {})
@@ -1343,50 +1175,63 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
             }]
         }
     
-    logger.info("rag_search_started", 
+    logger.info("rag_search_started",
                business_id=business_id,
-               query=search_query[:100])  # Log first 100 chars
+               query=search_query[:100])
     
     try:
-        # Step 1: Initialize RAG with timeout protection
-        try:
-            rag_config = await asyncio.wait_for(
-                initialize_rag(business_id=business_id),
-                timeout=60.0  # 60 second timeout for initialization
-            )
-        except asyncio.TimeoutError:
-            logger.error("rag_init_timeout", business_id=business_id)
-            return {
-                "messages": [{
-                    "role": "tool",
-                    "content": "The knowledge base is still loading. This can take a few minutes on first use. Please try your question again in a moment.",
-                    "tool_call_id": tool_call['id']
-                }]
-            }
-        except Exception as init_error:
-            logger.error("rag_init_failed", 
-                        business_id=business_id, 
-                        error=str(init_error),
-                        error_type=type(init_error).__name__)
-            return {
-                "messages": [{
-                    "role": "tool",
-                    "content": "I'm having trouble accessing the knowledge base right now. Please try again or contact support if the issue persists.",
-                    "tool_call_id": tool_call['id']
-                }]
-            }
+        collection_name = f"business_{business_id}_menu"
+    
+        # Lazy initialization - only if missing
+        if not await vector_store_exists(collection_name):
+            try:
+                rag_config = await asyncio.wait_for(
+                    initialize_rag(business_id=business_id),
+                    timeout=60.0
+                )
+                logger.info("rag_config_retrieved",
+                           business_id=business_id,
+                           status=rag_config.get("status"))
+            except asyncio.TimeoutError:
+                logger.error("rag_init_timeout", business_id=business_id)
+                try:
+                    opik_context.update_current_trace(
+                        metadata={
+                            "results_count": 0,
+                            "retrieval_success": False,
+                            "error": "timeout"
+                        }
+                    )
+                except Exception:
+                    pass
+                
+                return {
+                    "messages": [{
+                        "role": "tool",
+                        "content": "The knowledge base is still loading. Please try again in a moment.",
+                        "tool_call_id": tool_call['id']
+                    }]
+                }
+            except Exception as init_error:
+                logger.error("rag_init_failed",
+                            business_id=business_id,
+                            error=str(init_error),
+                            error_type=type(init_error).__name__)
+                return {
+                    "messages": [{
+                        "role": "tool",
+                        "content": "I'm having trouble accessing the knowledge base right now. Please try again or contact support if the issue persists.",
+                        "tool_call_id": tool_call['id']
+                    }]
+                }
         
-        logger.info("rag_config_retrieved", 
-                   business_id=business_id,
-                   status=rag_config.get("status"))
-        
-        # Step 2: Create retriever with POOLER connection (fast for queries)
+        # Always create vector store connection and search (outside lazy init block)
         try:
             vector_store = PGVectorStore.from_params(
-                connection_string=POSTGRES_URI_POOLER,  # Use pooler for queries
-                table_name=rag_config["collection_name"],
+                connection_string=POSTGRES_URI_POOLER,
+                table_name=collection_name,
                 embed_dim=384,
-                hybrid_search=False,
+                hybrid_search=True,
             )
             
             index = VectorStoreIndex.from_vector_store(vector_store)
@@ -1409,58 +1254,87 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
                 }]
             }
         
-        # Step 3: Perform search with timeout
+        # Perform the search
         try:
             nodes = await asyncio.wait_for(
                 retriever.aretrieve(search_query),
-                timeout=10.0  # 10 second timeout for search
+                timeout=10.0
             )
             
         except asyncio.TimeoutError:
-            logger.error("rag_search_timeout", 
-                        business_id=business_id, 
+            logger.error("rag_search_timeout",
+                        business_id=business_id,
                         query=search_query[:100])
+            try:
+                opik_context.update_current_trace(
+                    metadata={
+                        "results_count": 0,
+                        "retrieval_success": False,
+                        "error": "timeout"
+                    }
+                )
+            except Exception:
+                pass
+            
             return {
                 "messages": [{
                     "role": "tool",
-                    "content": "The search is taking longer than expected. Please try a more specific query or try again.",
+                    "content": "The search is taking longer than expected. Please try again.",
                     "tool_call_id": tool_call['id']
                 }]
             }
         
-        # Step 4: Process results
+        logger.info("rag_search_completed",
+                   business_id=business_id,
+                   results_found=len(nodes))
+        
+        # Log search metrics
+        try:
+            avg_score = sum(n.score for n in nodes) / len(nodes) if nodes else 0
+            opik_context.update_current_trace(
+                tags=["rag_search", f"business:{business_id}"],
+                metadata={
+                    "business_id": business_id,
+                    "query": search_query,
+                    "results_count": len(nodes),
+                    "avg_relevance_score": avg_score,
+                    "top_score": nodes[0].score if nodes else 0,
+                    "retrieval_success": len(nodes) > 0
+                }
+            )
+        except Exception:
+            pass
+        
+        # Handle no results
         if not nodes:
-            logger.info("rag_search_no_results", 
-                       business_id=business_id, 
+            logger.info("rag_search_no_results",
+                       business_id=business_id,
                        query=search_query[:100])
             return {
                 "messages": [{
                     "role": "tool",
-                    "content": "I couldn't find any information about that in the knowledge base. Please try rephrasing your question or ask about something else.",
+                    "content": f"No items found for '{search_query}'. Try a different search term.",
                     "tool_call_id": tool_call['id']
                 }]
             }
         
-        # Format results with source information
+        # Format results
         context_parts = []
         for i, node in enumerate(nodes, 1):
-            # Get node text and metadata
             text = node.node.text
             score = node.score if hasattr(node, 'score') else None
             
-            # Format with score if available
             if score:
-                context_parts.append(f"[Result {i} - Relevance: {score:.2f}]\n{text}")
+                context_parts.append(f"[Score: {score:.2f}]\n{text}")
             else:
                 context_parts.append(f"[Result {i}]\n{text}")
         
         context = "\n\n---\n\n".join(context_parts)
         
-        logger.info("rag_search_success", 
-                   business_id=business_id, 
-                   results_count=len(nodes),
-                   query_length=len(search_query),
-                   context_length=len(context))
+        logger.info("rag_search_success",
+                   business_id=business_id,
+                   results=len(nodes),
+                   top_score=nodes[0].score if nodes and hasattr(nodes[0], 'score') else None)
         
         return {
             "messages": [{
@@ -1471,24 +1345,31 @@ async def rag_search(state: MessagesState, config: RunnableConfig):
         }
     
     except Exception as e:
-        logger.error("rag_search_unexpected_error", 
-                    business_id=business_id, 
+        try:
+            opik_context.update_current_trace(
+                metadata={
+                    "results_count": 0,
+                    "retrieval_success": False,
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                }
+            )
+        except Exception:
+            pass
+        
+        logger.error("rag_search_unexpected_error",
+                    business_id=business_id,
                     error=str(e),
                     error_type=type(e).__name__)
         return {
             "messages": [{
                 "role": "tool",
-                "content": "Sorry, I encountered an unexpected error searching the knowledge base. Please try again or contact support if the issue persists.",
+                "content": "Sorry, I encountered an unexpected error. Please try again.",
                 "tool_call_id": tool_call['id']
             }]
-        }    
-    
-# ============================================
-# ROUTING
-# ============================================
+        }
 
 def route_customer_action(state: MessagesState) -> str:
-    """Route to the appropriate action node."""
     last_message = state["messages"][-1]
     
     if not (hasattr(last_message, 'tool_calls') and last_message.tool_calls):
@@ -1513,10 +1394,6 @@ def route_customer_action(state: MessagesState) -> str:
         return "remove_cart_item"
     
     return "__end__"
-
-# ============================================
-# GRAPH BUILDING
-# ============================================
 
 builder = StateGraph(MessagesState)
 builder.add_node("chatbot", chatbot)
@@ -1547,12 +1424,8 @@ builder.add_edge("check_address_and_finalize", "chatbot")
 builder.add_edge("add_to_cart", "chatbot")
 builder.add_edge("remove_cart_item", "chatbot")
 
-# ============================================
-# GRAPH INITIALIZATION
-# ============================================
-@monitor(operation="initialize_graph")
+
 async def initialize_graph():
-    """Initialize the graph with database connection."""
     global store, saver
     
     logger.info("graph_initialization_started")

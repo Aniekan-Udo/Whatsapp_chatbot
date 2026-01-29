@@ -48,7 +48,6 @@ from bot import (
     engine
 )
 
-from monitoring import setup_monitoring
 
 # ============================================
 # CONFIGURATION

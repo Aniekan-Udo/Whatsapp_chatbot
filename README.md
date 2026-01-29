@@ -26,11 +26,11 @@ Create a file named `.env` in the root directory and fill it with your credentia
 ```ini
 # --- Supabase Database (PostgreSQL) ---
 
-POSTGRES_URI_POOLER=postgresql://postgres.ifamzlkiifmqgpiuqmsv:nkereuwem@aws-1-eu-north-1.pooler.supabase.com:6543/postgres
+POSTGRES_URI_POOLER=postgresql://[USER]:[PASSWORD]@[HOST]:[PORT]/[DB_NAME]
 
 # --- Supabase Vector Store (for RAG) ---
 
-POSTGRES_URI=postgresql://postgres.ifamzlkiifmqgpiuqmsv:nkereuwem@aws-1-eu-north-1.pooler.supabase.com:5432/postgres
+POSTGRES_URI=postgresql://[USER]:[PASSWORD]@[HOST]:[PORT]/[DB_NAME]
 
 
 ```

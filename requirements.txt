@@ -11,6 +11,7 @@ llama-index-embeddings-cohere
 # Web Framework
 fastapi
 uvicorn[standard]
+gunicorn
 aiofiles
 # Database
 asyncpg
@@ -23,7 +24,7 @@ alembic
 llama-index-core
 llama-index-vector-stores-postgres
 llama-index-embeddings-ollama
-
+sentence_transformers 
 
 # Caching & Performance
 cashews[redis]
@@ -59,3 +60,4 @@ pandas
 
 # Security
 cryptography
+opik

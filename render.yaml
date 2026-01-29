@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: whatsapp-assistant
+    runtime: docker
+    plan: free
+    region: frankfurt
+    buildCommand: docker build -t whatsapp-assistant .
+    startCommand: gunicorn app:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:10000
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: POSTGRES_URI
+        sync: false
+      - key: POSTGRES_URI_POOLER
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: OPIK_API_KEY
+        sync: false
+      - key: COHERE_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: COHERE_EMBED_MODEL
+        value: embed-english-light-v3.0
