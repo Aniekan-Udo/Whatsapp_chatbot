@@ -91,12 +91,17 @@ try:
 except Exception as e:
     raise ValueError(f"Failed to initialize ChatGroq model: {e}")
 
+# ============================================
+# COMPLETE SQLAlchemy Setup - Replace in bot.py
+# ============================================
+
 async_uri = POSTGRES_URI.replace('postgresql://', 'postgresql+asyncpg://')
 
 if 'sslmode' not in async_uri:
     separator = '&' if '?' in async_uri else '?'
     async_uri += f'{separator}sslmode=require'
 
+# Remove autocommit - it's not recommended for asyncpg
 engine = create_async_engine(
     async_uri,
     pool_pre_ping=True,
@@ -106,10 +111,11 @@ engine = create_async_engine(
     echo=False,
     connect_args={
         "prepare_threshold": 0,
-        "autocommit": True,
+        "server_settings": {"jit": "off"}  # Better compatibility with Neon
     }
 )
 
+# Session factory for database operations
 async_session_factory = async_sessionmaker(
     engine,
     class_=AsyncSession,
