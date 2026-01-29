@@ -138,13 +138,13 @@ except Exception as e:
 # COMPLETE SQLAlchemy Setup - Replace in bot.py
 # ============================================
 
-# Use psycopg
-async_uri = POSTGRES_URI_POOLER.replace('postgresql://', 'postgresql+asyncpg://')
+async_uri = POSTGRES_URI.replace('postgresql://', 'postgresql+asyncpg://')
 
 if 'sslmode' not in async_uri:
     separator = '&' if '?' in async_uri else '?'
     async_uri += f'{separator}sslmode=require'
 
+# Remove autocommit - it's not recommended for asyncpg
 engine = create_async_engine(
     async_uri,
     pool_pre_ping=True,
@@ -153,12 +153,12 @@ engine = create_async_engine(
     max_overflow=10,
     echo=False,
     connect_args={
-        "prepare_threshold": 0,  
-        "autocommit": True,      
+        "prepare_threshold": 0,
+        "server_settings": {"jit": "off"}  # Better compatibility with Neon
     }
 )
 
-#Session factory for database operations
+# Session factory for database operations
 async_session_factory = async_sessionmaker(
     engine,
     class_=AsyncSession,
