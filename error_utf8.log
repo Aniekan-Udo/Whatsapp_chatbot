@@ -1,0 +1,37 @@
+﻿python : Traceback 
+(most recent call 
+last):
+At line:1 char:1
++ python app.py > 
+error.log 2>&1
++ ~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~
+    + CategoryInfo  
+            : NotS  
+  pecified: (Trac   
+ eback (most rec    
+ent call last):    
+:String) [], Re    
+moteException
+    + FullyQualifie 
+   dErrorId : Nati  
+  veCommandError
+ 
+  File "C:\Users\HP\
+Desktop\WAHA\app.py"
+, line 36, in 
+<module>
+    from bot import 
+(
+  File "C:\Users\HP\
+Desktop\WAHA\bot.py"
+, line 22, in 
+<module>
+    from langgraph.c
+heckpoint.aiosqlite 
+import 
+AsyncSqliteSaver
+ModuleNotFoundError:
+ No module named 'la
+nggraph.checkpoint.a
+iosqlite'

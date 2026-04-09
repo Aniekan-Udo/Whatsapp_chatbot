@@ -13,7 +13,16 @@ The backend provides a stateful chat API that utilizes **PostgreSQL** for storin
   * **Framework:** FastAPI (Python)
   * **Conversation Engine:** LangGraph
   * **Database/Vector Store:** Supabase (PostgreSQL + pgvector)
+  * **WhatsApp Integration:** PyWhatKit (requires active GUI session for Web automation)
   * **Deployment:** Designed for local development via Uvicorn/ngrok.
+
+-----
+
+## ⚠️ Important Note on PyWhatKit (Live Messaging)
+For the bot to send messages "live" to WhatsApp, it uses PyWhatKit under the hood. 
+- You **must** run the development server on a machine with a GUI and an active display.
+- Ensure you have a browser signed into WhatsApp Web.
+- The system will physically open new tabs, type the message, send it, and close the tab. **Do not use the mouse/keyboard while it is sending a message.**
 
 -----
 
@@ -98,10 +107,12 @@ The `/chat` endpoint requires a JSON body:
 ```json
 {
     "business_id": "JovitPizza",
-    "user_id": "whatsapp_user_12345",
-    "message": "What are the hours of operation?"
+    "user_id": "+1234567890",
+    "message": "What are the hours of operation?",
+    "live": true
 }
 ```
+*Note: Set `"live": true` to have the bot instantly forward its response to the `user_id` phone number via WhatsApp Web.*
 
 -----
 

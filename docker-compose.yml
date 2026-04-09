@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  waha:
+    image: devlikeapro/waha
+    container_name: waha
+    ports:
+      - "3000:3000"
+    environment:
+      - WAHA_LOG_LEVEL=info
+      - WAHA_PRINT_QR=True
+      - WAHA_DASHBOARD_NO_PASSWORD=True
+      - WHATSAPP_API_KEY=123123
+
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  chatbot:
+    build: .
+    container_name: chatbot
+    ports:
+      - "8001:8000"
+    env_file: .env
+    environment:
+      - WAHA_URL=http://waha:3000
+    depends_on:
+      waha:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./uploads:/app/uploads
+      - ./checkpoints:/app/
+      - ./synthetic_restaurant_menu_10000.csv:/app/menu.csv 

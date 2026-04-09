@@ -1,9 +1,8 @@
 import asyncio
 import sys
 
-# Fix for Windows + psycopg async - ONLY apply on Windows
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+# Psycopg 3.2+ supports ProactorEventLoop natively on Windows.
+# No need to force SelectorEventLoopPolicy anymore.
 
 import os
 import re
@@ -16,7 +15,7 @@ from pathlib import Path
 from datetime import datetime
 
 # FastAPI
-from fastapi import FastAPI, HTTPException, Request, status, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, status, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -25,7 +24,7 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage
 
 # SQLAlchemy
-from sqlalchemy import select, distinct
+from sqlalchemy import select
 
 # Rate limiting
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -40,8 +39,6 @@ from bot import (
     get_business_document,
     initialize_rag,
     logger,
-    store,
-    saver,
     async_session_factory,
     BusinessDocument,
     setup_database,
@@ -68,6 +65,7 @@ class ChatRequest(BaseModel):
     business_id: str = Field(..., description="Business identifier")
     user_id: str = Field(..., description="User identifier")
     thread_id: Optional[str] = Field(None, description="Thread ID for conversation")
+    live: bool = Field(False, description="Set to true to send the response live via PyWhatKit. user_id must be a valid phone number with '+' country code.")
 
 class ChatResponse(BaseModel):
     response: str
@@ -97,6 +95,33 @@ def sanitize_filename(filename: str) -> str:
     filename = filename.replace('/', '').replace('\\', '')
     return filename[:200]
 
+
+def extract_final_response(result) -> str:
+    """
+    Extract the last natural-language response from the LangGraph state.
+    Skips intermediate tool-calling messages and raw tool results.
+    """
+    messages = result.get("messages", [])
+    if not messages:
+        return ""
+
+    # Search backwards for the last conversational AI message
+    for msg in reversed(messages):
+        # type 'ai' is AIMessage
+        if hasattr(msg, 'type') and msg.type == 'ai':
+            # If it has tool calls, it was likely an intermediate step
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                # If this is the VERY last message and it's the only AI msg with content, use it
+                if msg == messages[-1] and msg.content:
+                    return msg.content
+                continue
+            if msg.content:
+                return msg.content
+
+    # Fallback to the very last message content if no clean AIMessage found
+    last_msg = messages[-1]
+    return getattr(last_msg, 'content', str(last_msg))
+
 # ============================================
 # GLOBAL STATE
 # ============================================
@@ -106,7 +131,8 @@ background_tasks: Set[asyncio.Task] = set()
 # Lazy initialization flags
 _db_initialized = False
 _graph_instance = None
-_initialization_lock = asyncio.Lock()
+_db_init_lock = asyncio.Lock()
+_graph_init_lock = asyncio.Lock()
 
 # ============================================
 # LAZY INITIALIZATION FUNCTIONS
@@ -119,11 +145,9 @@ async def ensure_database_initialized():
     if _db_initialized:
         return
     
-    async with _initialization_lock:
-        # Double-check after acquiring lock
+    async with _db_init_lock:
         if _db_initialized:
             return
-        
         logger.info("lazy_database_initialization_started")
         await setup_database()
         _db_initialized = True
@@ -136,16 +160,48 @@ async def get_or_create_graph():
     if _graph_instance is not None:
         return _graph_instance
     
-    async with _initialization_lock:
-        # Double-check after acquiring lock
+    async with _graph_init_lock:
         if _graph_instance is not None:
             return _graph_instance
-        
         logger.info("lazy_graph_initialization_started")
         await ensure_database_initialized()
         _graph_instance = await initialize_graph()
         logger.info("lazy_graph_initialization_completed")
         return _graph_instance
+
+async def process_whatsapp_message(phone_no: str, message_text: str, reply_chat_id: str = None):
+    """Process an incoming WhatsApp message and reply via WAHA."""
+    try:
+        logger.info("processing_whatsapp_message", phone=phone_no)
+        graph = await get_or_create_graph()
+        thread_id = f"waha_{phone_no}"
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "business_id": "default",
+                "user_id": phone_no
+            }
+        }
+        input_message = {
+            "messages": [HumanMessage(content=message_text)]
+        }
+        result = await graph.ainvoke(input_message, config)
+
+        ai_response = extract_final_response(result)
+
+        if not ai_response:
+            logger.warning("empty_ai_response_skipped", phone=phone_no)
+            return
+
+        logger.info("ai_response_generated", phone=phone_no, response_length=len(ai_response))
+        from whatsapp_service import enqueue_whatsapp_message
+        # Use the original chat_id (LID or phone) if provided — WAHA routes correctly with it
+        target = reply_chat_id if reply_chat_id else phone_no
+        await enqueue_whatsapp_message(target, ai_response)
+        logger.info("whatsapp_reply_sent", phone=phone_no, target=target)
+    except Exception as e:
+        logger.error("webhook_processing_failed", phone=phone_no, error=str(e), error_type=type(e).__name__)
+
 
 # ============================================
 # LIFESPAN MANAGEMENT (ULTRA-FAST STARTUP)
@@ -217,8 +273,8 @@ app = FastAPI(
 @app.get("/ping")
 @app.head("/ping")  # Support HEAD requests from health checkers
 async def ping():
-    """Instant response - no dependencies"""
-    return {"status": "ok"}
+    """Ultra-fast ping endpoint - instant response, no dependencies"""
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
     
 # CORS middleware
@@ -263,10 +319,7 @@ async def add_request_id(request: Request, call_next):
 # HEALTH CHECKS - MUST BE FIRST (BEFORE OTHER ROUTES)
 # ============================================
 
-@app.get("/ping")
-async def ping():
-    """Ultra-fast ping endpoint - instant response, no dependencies"""
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -371,8 +424,24 @@ async def chat(request: Request, chat_request: ChatRequest):
             timeout=30.0
         )
         
-        # Extract AI response
-        ai_response = result["messages"][-1].content
+        # Extract AI response with filtering
+        ai_response = extract_final_response(result)
+        
+        # --- PYWHATKIT LIVE BROADCAST ---
+        if getattr(chat_request, "live", False):
+            # Use TEST_WHATSAPP_NUMBER from .env if available, else fallback to chat_request.user_id
+            test_target_number = os.getenv("TEST_WHATSAPP_NUMBER")
+            target_number = test_target_number if test_target_number else chat_request.user_id
+            
+            if target_number and target_number.startswith("+"):
+                try:
+                    from whatsapp_service import enqueue_whatsapp_message
+                    await enqueue_whatsapp_message(target_number, ai_response)
+                    logger.info("whatsapp_message_queued", target_number=target_number, is_test_number=bool(test_target_number))
+                except Exception as e:
+                    logger.error("failed_to_enqueue_whatsapp", error=str(e))
+            else:
+                logger.warning("whatsapp_live_skipped_invalid_phone", target_number=target_number)
         
         logger.info(
             "chat_response_generated",
@@ -404,6 +473,82 @@ async def chat(request: Request, chat_request: ChatRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process message: {str(e)}"
         )
+
+@app.post("/webhook/waha")
+async def waha_webhook(request: Request, bg_tasks: BackgroundTasks):
+    """Receive incoming WhatsApp messages from WAHA"""
+    try:
+        data = await request.json()
+        waha_event = data.get("event")
+        payload = data.get("payload", {})
+
+        # We only care about incoming text messages
+        if waha_event == "message" and not payload.get("fromMe", True):
+            message_text = payload.get("body", "").strip()
+            if not message_text:
+                return {"status": "skipped"}
+
+            # The raw sender ID (may be a phone number OR a WhatsApp LID)
+            raw_from: str = str(payload.get("from", ""))
+
+            # Skip group chats (group IDs contain a dash: 1234567890-1234567890@g.us)
+            if "-" in raw_from.split("@")[0]:
+                logger.info("skipping_group_chat", sender=raw_from)
+                return {"status": "skipped"}
+
+            def looks_like_phone(raw: str) -> str | None:
+                """Return bare digits if raw looks like an E.164 phone number."""
+                num = raw.split("@")[0].strip()
+                if num.isdigit() and 7 <= len(num) <= 15:
+                    return num
+                return None
+
+            raw_number = looks_like_phone(raw_from)
+
+            # If 'from' is a LID (WhatsApp internal ID), resolve it via WAHA contacts API
+            if not raw_number:
+                try:
+                    waha_url = os.getenv("WAHA_URL", "http://localhost:3000")
+                    import httpx
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.get(
+                            f"{waha_url}/api/default/contacts",
+                            params={"contactId": raw_from},
+                            headers={"X-Api-Key": "123123"},
+                            timeout=5.0
+                        )
+                        if resp.status_code == 200:
+                            contact = resp.json()
+                            # WAHA returns either a list or a single object
+                            if isinstance(contact, list) and contact:
+                                contact = contact[0]
+                            # Try 'id' or 'number' field from contact
+                            contact_id = contact.get("id", "") or contact.get("number", "")
+                            raw_number = looks_like_phone(str(contact_id))
+                            if raw_number:
+                                logger.info("lid_resolved", lid=raw_from, phone=raw_number)
+                            else:
+                                logger.warning("lid_resolve_no_number", lid=raw_from, contact=contact)
+                except Exception as lid_err:
+                    logger.warning("lid_resolve_failed", lid=raw_from, error=str(lid_err))
+
+            if not raw_number:
+                logger.info("skipping_non_user_event", sender=raw_from, reason="unresolvable_lid")
+                return {"status": "skipped"}
+
+            phone_no = f"+{raw_number}"
+            # Use the original raw_from as reply target (WAHA needs the @c.us suffix)
+            reply_chat_id = raw_from if "@" in raw_from else f"{raw_number}@c.us"
+
+            logger.info("received_whatsapp_webhook", phone=phone_no, message_length=len(message_text))
+            bg_tasks.add_task(process_whatsapp_message, phone_no, message_text, reply_chat_id)
+
+        return {"status": "success"}
+    except Exception as e:
+        logger.error("webhook_error", error=str(e))
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 
 # ============================================
 # DOCUMENT MANAGEMENT
@@ -684,13 +829,13 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 if __name__ == "__main__":
     import uvicorn
+    import asyncio
     
     port = int(os.getenv("PORT", 8001))
     
-    # Print port binding info for deployment platforms
     print("=" * 60)
     print(f"🚀 BINDING TO PORT: {port}")
-    print(f"🌐 HOST: 0.0.0.0")
+    print("🌐 HOST: 0.0.0.0")
     print(f"📍 Health check: http://0.0.0.0:{port}/ping")
     print("=" * 60)
     
@@ -699,9 +844,10 @@ if __name__ == "__main__":
                port=port)
     
     uvicorn.run(
-        app,
+        "app:app",  # Pass as string for cleaner imports
         host="0.0.0.0",
         port=port,
         log_level="info",
-        timeout_keep_alive=65
+        timeout_keep_alive=65,
+        loop="asyncio"  # Use standard asyncio loop which respects our policy
     )
