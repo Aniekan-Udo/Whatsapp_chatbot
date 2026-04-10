@@ -25,8 +25,7 @@ aiosqlite
 # Vector Store & Embeddings
 llama-index-core
 llama-index-vector-stores-postgres
-llama-index-embeddings-ollama
-sentence_transformers 
+
 
 # Caching & Performance
 cashews[redis]
@@ -46,17 +45,7 @@ tenacity
 structlog
 prometheus-client
 
-# OpenTelemetry (UPDATED & VERSION-ALIGNED)
-opentelemetry-api==1.38.0
-opentelemetry-sdk==1.38.0
-opentelemetry-semantic-conventions==0.59b0
-opentelemetry-instrumentation==0.59b0
-opentelemetry-instrumentation-fastapi==0.59b0
-opentelemetry-instrumentation-asyncpg==0.59b0
-opentelemetry-instrumentation-sqlalchemy==0.59b0
-opentelemetry-instrumentation-psycopg==0.59b0
-opentelemetry-exporter-otlp-proto-grpc==1.38.0
-opentelemetry-exporter-prometheus==0.59b0
+
 
 # Data Processing
 pandas
