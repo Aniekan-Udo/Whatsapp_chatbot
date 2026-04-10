@@ -130,7 +130,7 @@ async_session_factory = async_sessionmaker(
     expire_on_commit=False
 )
 
-print("✅ SQLAlchemy engine created with statement_cache_size=0 (Windows compatible)")
+print("SQLAlchemy engine created with statement_cache_size=0 (Windows compatible)")
 
 Base = declarative_base()
 
@@ -344,14 +344,10 @@ async def setup_database():
 
         logger.info("sqlalchemy_tables_created")
 
-        # AsyncSqliteSaver.from_conn_string() returns an async context manager.
-        # We must enter it with `async with` to get the actual saver object.
-        # Store the context manager in _saver_ctx to keep it alive for the
-        # lifetime of the application.
+        
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-        # Use your original POSTGRES_URI (not the asyncpg one)
-        # AsyncPostgresSaver manages its own psycopg3 connection
+       
         _saver_ctx = AsyncPostgresSaver.from_conn_string(POSTGRES_URI)
         saver = await _saver_ctx.__aenter__()
         await saver.setup()
