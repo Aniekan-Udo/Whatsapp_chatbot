@@ -159,8 +159,11 @@ class BusinessDocument(Base):
     document_type = Column(String)
     status = Column(String, default='active')
     doc_metadata = Column('metadata', JSON)
+    business_name = Column(String, nullable=True, default='Our Restaurant')  # ADD
+    business_context = Column(String, nullable=True)                          # ADD
     uploaded_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
 
 
 # ============================================
@@ -383,47 +386,11 @@ async def setup_database():
 # DOCUMENT MANAGEMENT
 # ============================================
 
-async def register_business_document(
+async def register_business_config(
     business_id: str,
-    document_path: str,
-    document_name: str = None,
-    document_type: str = None,
-    metadata: dict = None
-):
-    if not document_path.startswith('s3://') and not os.path.exists(document_path):
-        raise FileNotFoundError(f"Document not found: {document_path}")
-
-    if not document_type:
-        document_type = os.path.splitext(document_path)[1].replace('.', '').lower()
-    if not document_name:
-        document_name = os.path.basename(document_path)
-
-    async with async_session_factory() as session:
-        doc = BusinessDocument(
-            business_id=business_id,
-            document_path=document_path,
-            document_name=document_name,
-            document_type=document_type,
-            doc_metadata=metadata,
-            status='active'
-        )
-
-        await session.merge(doc)
-        await session.commit()
-
-    logger.info("document_registered", business_id=business_id, document_name=document_name)
-
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=5),
-    retry=retry_if_exception_type((
-        psycopg_errors.Error,
-        ConnectionError,
-    )),
-    reraise=True
-)
-async def get_business_document(business_id: str) -> Optional[str]:
+    business_name: str,
+    business_context: str = "",
+) -> None:
     async with async_session_factory() as session:
         result = await session.execute(
             select(BusinessDocument).where(
@@ -432,16 +399,39 @@ async def get_business_document(business_id: str) -> Optional[str]:
             )
         )
         doc = result.scalar_one_or_none()
+        if not doc:
+            raise ValueError(f"No document found for business_id: {business_id}. Upload a document first.")
+        doc.business_name = business_name
+        doc.business_context = business_context
+        doc.updated_at = func.now()
+        await session.commit()
+    logger.info("business_config_registered", business_id=business_id)
 
-        if doc:
-            if not doc.document_path.startswith('s3://') and not os.path.exists(doc.document_path):
-                logger.warning("document_path_missing", business_id=business_id, path=doc.document_path)
-                return None
 
-            logger.info("document_found", business_id=business_id, document_name=doc.document_name)
-            return doc.document_path
+async def get_business_config(business_id: str) -> Dict[str, Any]:
+    try:
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(BusinessDocument).where(
+                    BusinessDocument.business_id == business_id,
+                    BusinessDocument.status == 'active'
+                )
+            )
+            doc = result.scalar_one_or_none()
+            if doc:
+                return {
+                    "business_name": doc.business_name or "Our Restaurant",
+                    "business_context": doc.business_context or "",
+                }
+    except Exception as e:
+        logger.warning("business_config_fetch_failed", business_id=business_id, error=str(e))
 
-        return None
+    return {
+        "business_name": "Our Restaurant",
+        "business_context": "",
+    }
+
+
 
 
 async def create_metadata_indexes(business_id: str):
@@ -680,15 +670,20 @@ async def chatbot(state: MessagesState, config: RunnableConfig):
     business_id = config["configurable"]["business_id"]
 
     namespace = ("profile", business_id, user_id)
-    key = "user_memory"
-    existing_memory = await store.aget(namespace, key)
+    existing_memory = await store.aget(namespace, "user_memory")
+    existing_memory_content = (
+        existing_memory.value.get('memory')
+        if existing_memory
+        else "No existing memory found."
+    )
 
-    if existing_memory:
-        existing_memory_content = existing_memory.value.get('memory')
-    else:
-        existing_memory_content = "No existing memory found."
+    biz_config = await get_business_config(business_id)
 
-    system_msg = MSG_PROMPT.format(user_profile=existing_memory_content)
+    system_msg = MSG_PROMPT.format(
+        business_name=biz_config["business_name"],
+        business_context=biz_config["business_context"],
+        user_profile=existing_memory_content
+    )
 
     try:
         response = await call_groq_api(
@@ -700,16 +695,12 @@ async def chatbot(state: MessagesState, config: RunnableConfig):
         return {"messages": [response]}
 
     except Exception as e:
-        logger.error("chatbot_api_failure",
-                     business_id=business_id,
-                     error=str(e))
-
+        logger.error("chatbot_api_failure", business_id=business_id, error=str(e))
         return {
             "messages": [AIMessage(
-                content="I'm having trouble connecting right now. Please try again in a moment or contact support if this continues."
+                content="I'm having trouble connecting right now. Please try again in a moment."
             )]
         }
-
 
 async def write_memory(state: MessagesState, config: RunnableConfig):
     global store
