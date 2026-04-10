@@ -38,6 +38,8 @@ from bot import (
     register_business_document,
     get_business_document,
     initialize_rag,
+    register_business_config,
+    get_business_config,
     logger,
     async_session_factory,
     BusinessDocument,
@@ -474,6 +476,31 @@ async def chat(request: Request, chat_request: ChatRequest):
             detail=f"Failed to process message: {str(e)}"
         )
 
+@app.post("/business/{business_id}/config")
+async def upsert_business_config(
+    business_id: str,
+    business_name: str = Form(...),
+    business_context: str = Form("")
+):
+    await ensure_database_initialized()
+    await register_business_config(
+        business_id=business_id,
+        business_name=business_name,
+        business_context=business_context
+    )
+    return {
+        "business_id": business_id,
+        "business_name": business_name,
+        "message": "Config saved successfully"
+    }
+
+
+@app.get("/business/{business_id}/config")
+async def get_business_config_endpoint(business_id: str):
+    await ensure_database_initialized()
+    config = await get_business_config(business_id)
+    return {"business_id": business_id, **config}
+    
 @app.post("/webhook/waha")
 async def waha_webhook(request: Request, bg_tasks: BackgroundTasks):
     """Receive incoming WhatsApp messages from WAHA"""
