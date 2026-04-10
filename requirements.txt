@@ -25,7 +25,7 @@ aiosqlite
 # Vector Store & Embeddings
 llama-index-core
 llama-index-vector-stores-postgres
-
+langgraph-store-redis
 
 # Caching & Performance
 cashews[redis]
