@@ -386,6 +386,66 @@ async def setup_database():
 # DOCUMENT MANAGEMENT
 # ============================================
 
+async def register_business_document(
+    business_id: str,
+    document_path: str,
+    document_name: str = None,
+    document_type: str = None,
+    metadata: dict = None
+):
+    if not document_path.startswith('s3://') and not os.path.exists(document_path):
+        raise FileNotFoundError(f"Document not found: {document_path}")
+
+    if not document_type:
+        document_type = os.path.splitext(document_path)[1].replace('.', '').lower()
+    if not document_name:
+        document_name = os.path.basename(document_path)
+
+    async with async_session_factory() as session:
+        doc = BusinessDocument(
+            business_id=business_id,
+            document_path=document_path,
+            document_name=document_name,
+            document_type=document_type,
+            doc_metadata=metadata,
+            status='active'
+        )
+        await session.merge(doc)
+        await session.commit()
+
+    logger.info("document_registered", business_id=business_id, document_name=document_name)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=5),
+    retry=retry_if_exception_type((
+        psycopg_errors.Error,
+        ConnectionError,
+    )),
+    reraise=True
+)
+async def get_business_document(business_id: str) -> Optional[str]:
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(BusinessDocument).where(
+                BusinessDocument.business_id == business_id,
+                BusinessDocument.status == 'active'
+            )
+        )
+        doc = result.scalar_one_or_none()
+
+        if doc:
+            if not doc.document_path.startswith('s3://') and not os.path.exists(doc.document_path):
+                logger.warning("document_path_missing", business_id=business_id, path=doc.document_path)
+                return None
+
+            logger.info("document_found", business_id=business_id, document_name=doc.document_name)
+            return doc.document_path
+
+        return None
+
+
 async def register_business_config(
     business_id: str,
     business_name: str,
