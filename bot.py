@@ -57,8 +57,6 @@ load_dotenv()
 # OPIK CONFIGURATION
 # ============================================
 
-opik.configure(api_key=os.getenv("OPIK_API_KEY"))
-
 # ============================================
 # ENVIRONMENT VARIABLES
 # ============================================
