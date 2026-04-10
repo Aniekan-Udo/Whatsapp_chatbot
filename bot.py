@@ -350,9 +350,11 @@ async def setup_database():
         saver = await _saver_ctx.__aenter__()
         await saver.setup()
 
-        from langgraph.store.redis.aio import AsyncRedisStore
 
-        store = AsyncRedisStore.from_conn_string(os.getenv("REDIS_URI"))
+        from langgraph.store.postgres.aio import AsyncPostgresStore
+
+        _store_ctx = AsyncPostgresStore.from_conn_string(POSTGRES_URI)
+        store = await _store_ctx.__aenter__()
         await store.setup()
 
         logger.info("database_setup_completed")
