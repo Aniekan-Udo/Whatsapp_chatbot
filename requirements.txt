@@ -28,7 +28,7 @@ llama-index-vector-stores-postgres
 
 slowapi
 httpx
-
+cashews
 # Utilities
 pydantic
 python-multipart
