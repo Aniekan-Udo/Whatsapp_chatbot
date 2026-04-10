@@ -348,6 +348,13 @@ async def setup_database():
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
+            # Add new columns if they don't exist
+            await conn.execute(text("""
+                ALTER TABLE business_documents 
+                ADD COLUMN IF NOT EXISTS business_name VARCHAR,
+                ADD COLUMN IF NOT EXISTS business_context VARCHAR
+            """))
+
         logger.info("sqlalchemy_tables_created")
 
         
