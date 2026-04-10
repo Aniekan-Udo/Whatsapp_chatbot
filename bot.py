@@ -352,9 +352,18 @@ async def setup_database():
 
 
         from langgraph.store.postgres.aio import AsyncPostgresStore
-
-        _store_ctx = AsyncPostgresStore.from_conn_string(POSTGRES_URI)
-        store = await _store_ctx.__aenter__()
+        from psycopg_pool import AsyncConnectionPool
+        
+        _store_pool = AsyncConnectionPool(
+            conninfo=POSTGRES_URI,
+            max_size=5,
+            kwargs={
+                "autocommit": True,
+                "prepare_threshold": 0,
+            }
+        )
+        await _store_pool.open()
+        store = AsyncPostgresStore(_store_pool)
         await store.setup()
 
         logger.info("database_setup_completed")
