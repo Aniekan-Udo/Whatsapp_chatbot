@@ -1,4 +1,4 @@
-# WhatsApp Restaurant Assistant 🍕💬
+# WhatsApp Restaurant Assistant
 
 An AI assistant that chats with your customers on **WhatsApp**, answers questions about your menu, takes their orders, and hands them over to your staff when they're ready to pay — 24 hours a day.
 
@@ -74,7 +74,7 @@ You don't need to be a programmer to understand the setup, but someone comfortab
 5. **A PostgreSQL database with the `pgvector` extension.** A free [Supabase](https://supabase.com) project works well.
 6. *(Optional)* **An Opik account** (<https://www.comet.com/opik>) if you want to monitor how the AI is performing.
 
-> 💡 An **API key** is like a password that lets this software use an online service on your behalf. Keep them private and never share or publish them.
+> **Tip:** An **API key** is like a password that lets this software use an online service on your behalf. Keep them private and never share or publish them.
 
 ---
 
@@ -133,7 +133,7 @@ Open <http://localhost:8001/docs>. This is a simple web page where you can try e
 1. **Set your business name and description:** use `POST /business/{business_id}/config`. Pick a short ID for your business, e.g. `default`.
 2. **Upload your menu:** use `POST /documents/upload` with the same business ID and your menu file (`.csv`, `.pdf`, `.txt` or `.json`, up to 50 MB).
 
-> ℹ️ Messages that arrive on WhatsApp are handled under the business ID **`default`**, so use `default` for the business you connect to WhatsApp.
+> **Note:** Messages that arrive on WhatsApp are handled under the business ID **`default`**, so use `default` for the business you connect to WhatsApp.
 
 ### Step 6 — Try it!
 
@@ -239,10 +239,10 @@ You'll still need WAHA running (e.g. `docker compose up -d waha`) and `WAHA_URL=
 
 | Variable | Required | Description |
 |---|---|---|
-| `API_KEY` | ✅ | Groq API key |
-| `POSTGRES_URI` | ✅ | Postgres connection (vector store) |
-| `POSTGRES_URI_POOLER` | ✅ | Postgres pooled connection (checkpoints/memory) |
-| `COHERE_API_KEY` | ✅ | Cohere API key for embeddings |
+| `API_KEY` | Yes | Groq API key |
+| `POSTGRES_URI` | Yes | Postgres connection (vector store) |
+| `POSTGRES_URI_POOLER` | Yes | Postgres pooled connection (checkpoints/memory) |
+| `COHERE_API_KEY` | Yes | Cohere API key for embeddings |
 | `GROQ_MODEL` | — | Default `llama-3.3-70b-versatile` |
 | `COHERE_EMBED_MODEL` | — | Default `embed-english-light-v3.0` |
 | `WAHA_URL` | — | Default `http://localhost:3000` (set automatically in Docker) |
